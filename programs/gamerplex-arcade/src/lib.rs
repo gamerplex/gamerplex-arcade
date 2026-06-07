@@ -51,6 +51,9 @@ pub const GAME_SEED: &[u8] = b"game";
 pub const PROFILE_SEED: &[u8] = b"profile";
 pub const RECEIPT_SEED: &[u8] = b"receipt";
 pub const STABLECOINS_SEED: &[u8] = b"stablecoins";
+pub const PROFILE_EXT_SEED: &[u8] = b"profile-ext";
+pub const HANDLE_CLAIM_SEED: &[u8] = b"handle-claim";
+pub const RATES_SEED: &[u8] = b"rates";
 
 // SPL Token program IDs (used for introspecting token transfers in-tx).
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
@@ -71,6 +74,20 @@ pub const MAX_GAME_NAME_LEN: usize = 32;
 pub const MAX_VARIANT_LEN: usize = 32;
 pub const MAX_META_LEN: usize = 64;
 pub const MAX_MEMO_LEN: usize = 450; // well under Solana's 1232-byte legacy memo ceiling
+
+// ProfileExtV2 / HandleClaim identity-layer limits.
+pub const MIN_HANDLE_LEN: usize = 3;
+pub const MAX_HANDLE_LEN: usize = 32;
+pub const MAX_BIO_LEN: usize = 140;
+
+// Reserved handles — global blacklist enforced by set_handle. Adding more is a
+// program upgrade. Order doesn't matter; comparisons are linear scan over a
+// short list.
+pub const RESERVED_HANDLES: &[&str] = &[
+    "admin", "system", "root", "null", "anonymous", "deleted",
+    "gamerplex", "sledgit", "petlegends", "pltcg",
+    "support", "help", "official", "team", "mod",
+];
 
 // Cross-game cosmetic ownership: 16 × u32 = 512 one-bit slots.
 pub const COSMETIC_BITMAP_WORDS: usize = 16;
@@ -125,6 +142,33 @@ pub const MAX_REPLAY_MEMO_LEN: usize = 700;
 // Encoded base58 string lengths for 32-byte arrays (used for seed + move_hash).
 // bs58 of 32 bytes is variable up to 44 chars. We render into a Vec<u8> at
 // emit time.
+
+// ── Multi-token payment constants (v1.3) ────────────────────────────────
+// $GAME mint is compile-time per network so the binary literally cannot
+// decode a transfer of a different mint as $GAME. Build mainnet artifact
+// with `anchor build -- --features mainnet`.
+#[cfg(feature = "mainnet")]
+pub const GAME_TOKEN_MINT: Pubkey =
+    solana_program::pubkey!("7TTBUfDomCKBMemv7FF37Tg3y52cRkAxn8vJnvKD4rsE");
+#[cfg(not(feature = "mainnet"))]
+pub const GAME_TOKEN_MINT: Pubkey =
+    solana_program::pubkey!("8eGnj5jkW6zTGYieGhtejPjLtGmnKfCdk7FamoJ5LLvD");
+
+pub const GAME_TOKEN_DECIMALS: u8 = 10;
+pub const STABLECOIN_DECIMALS: u8 = 6;
+
+// Off-chain bot pushes rates every 15min. SOL moves ~5-10%/day, $GAME is
+// near-zero velocity pre-Jupiter — tighten $GAME window to 6hr post-listing.
+pub const MAX_RATE_STALENESS_SOL_SEC: i64 = 3_600;        // 1 hour
+pub const MAX_RATE_STALENESS_GAME_SEC: i64 = 24 * 3_600;  // 24 hours
+
+// Tolerance on rate-converted payments. Frontend must overpay slightly
+// (see RATE_OVERPAY_BPS in client.ts) to stay above this floor.
+pub const PAYMENT_SLIPPAGE_BPS: u64 = 100;  // 1%
+
+// Rates are stored scaled ×1e12 (micro-USD per smallest unit). At SOL=$150,
+// 1 lamport = 0.15 micro-USD → store as 150_000_000_000. Division on use.
+pub const RATE_SCALE_FACTOR: u128 = 1_000_000_000_000;
 
 #[program]
 pub mod gamerplex_arcade {
@@ -487,23 +531,26 @@ pub mod gamerplex_arcade {
         ctx: Context<RecordPayment>,
         // Category: 0 Continue | 1 Powerup | 2 ScoreCommit | 3 Cosmetic
         //         | 4 VerifiedCommit (requires external_ref = Arweave tx id)
+        //         | 5 ReplayReceipt | 6 CnftWrap
         category: u8,
+        // USD-equivalent value being paid (always in micro-USD, 6-decimal).
+        // For stablecoins this equals payment_amount_raw. For SOL/$GAME the
+        // frontend computes raw via the on-chain rate (and overpays slightly
+        // for slippage) — contract validates raw ≥ floor.
         amount_micro_usd: u64,
+        // Pubkey::default() = native SOL. Else the SPL mint of the transfer.
+        // $GAME_TOKEN_MINT triggers the $GAME path (gamer_paid = true accrued).
+        payment_mint: Pubkey,
+        // Actual smallest-unit (lamports for SOL, token quarks for SPL).
+        payment_amount_raw: u64,
         payment_tx_sig: [u8; 64],
-        gamer_paid: bool,
-        // Off-chain reference — typically an Arweave tx ID pointing at the
-        // permanently-stored move log for VERIFIED-tier runs. Empty string
-        // for non-VERIFIED categories. Max 64 chars (Arweave is 43).
         external_ref: String,
     ) -> Result<()> {
         require!(category <= CATEGORY_CNFT_WRAP, ArcadeError::InvalidPaymentCategory);
         require!(external_ref.len() <= MAX_EXTERNAL_REF_LEN, ArcadeError::ExternalRefTooLong);
-        // v1.2 scope: only USDC-path payments verified. $GAMER-paid actions are
-        // v1.3+ (need their own introspection against $GAMER token transfer).
-        require!(!gamer_paid, ArcadeError::GamerPaymentsDisabled);
-        // Enforce exact Gamerplex fees for fixed-price tiers.
-        // Categories 0/1/3 (Continue/Powerup/Cosmetic) are client-priced per
-        // game/item — enforced downstream via game config.
+
+        // Enforce exact Gamerplex fees for fixed-price tiers (USD-denominated).
+        // Categories 0/1/3 (Continue/Powerup/Cosmetic) are client-priced per game.
         if category == CATEGORY_SCORE_COMMIT {
             require!(amount_micro_usd == SCORE_COMMIT_MICRO_USD, ArcadeError::InvalidScoreCommitAmount);
         } else if category == CATEGORY_VERIFIED_COMMIT {
@@ -513,29 +560,74 @@ pub mod gamerplex_arcade {
         } else if category == CATEGORY_CNFT_WRAP {
             require!(amount_micro_usd == CNFT_WRAP_MICRO_USD, ArcadeError::InvalidCnftWrapAmount);
         }
-        // Defense: amount must be in the sane microtransaction range.
-        require!(
-            amount_micro_usd >= MIN_PAYMENT_MICRO_USD,
-            ArcadeError::PaymentBelowMin
-        );
-        require!(
-            amount_micro_usd <= MAX_PAYMENT_MICRO_USD,
-            ArcadeError::PaymentAboveMax
-        );
-
-        // Require the matching SPL TransferChecked to be present in this tx.
-        verify_stablecoin_transfer_in_tx(
-            &ctx.accounts.instructions_sysvar.to_account_info(),
-            &ctx.accounts.stablecoin_config.mints,
-            &ctx.accounts.config.treasury_wallet,
-            &ctx.accounts.player.key(),
-            amount_micro_usd,
-        )?;
+        require!(amount_micro_usd >= MIN_PAYMENT_MICRO_USD, ArcadeError::PaymentBelowMin);
+        require!(amount_micro_usd <= MAX_PAYMENT_MICRO_USD, ArcadeError::PaymentAboveMax);
 
         let now = Clock::get()?.unix_timestamp;
         let game_id = ctx.accounts.game.game_id;
         let player_key = ctx.accounts.player.key();
+        let treasury = ctx.accounts.config.treasury_wallet;
+        let rates = &ctx.accounts.rates;
+        let gamer_paid = payment_mint == GAME_TOKEN_MINT;
 
+        // ── Branch on payment_mint ────────────────────────────────────
+        if payment_mint == Pubkey::default() {
+            // Native SOL path
+            require!(
+                now.saturating_sub(rates.sol_updated_at) <= MAX_RATE_STALENESS_SOL_SEC,
+                ArcadeError::ExchangeRateStale
+            );
+            let expected = convert_usd_to_raw(amount_micro_usd, rates.sol_micro_usd_per_lamport)?;
+            let min_lamports = apply_slippage_floor(expected, PAYMENT_SLIPPAGE_BPS)?;
+            require!(payment_amount_raw >= min_lamports, ArcadeError::PaymentUnderpaid);
+            verify_sol_transfer_in_tx(
+                &ctx.accounts.instructions_sysvar.to_account_info(),
+                &treasury,
+                &player_key,
+                payment_amount_raw,
+            )?;
+        } else if payment_mint == GAME_TOKEN_MINT {
+            // $GAME path (20% discount already applied frontend-side to amount_micro_usd)
+            require!(
+                now.saturating_sub(rates.game_updated_at) <= MAX_RATE_STALENESS_GAME_SEC,
+                ArcadeError::ExchangeRateStale
+            );
+            let expected = convert_usd_to_raw(amount_micro_usd, rates.game_micro_usd_per_quark)?;
+            let min_quarks = apply_slippage_floor(expected, PAYMENT_SLIPPAGE_BPS)?;
+            require!(payment_amount_raw >= min_quarks, ArcadeError::PaymentUnderpaid);
+            verify_spl_transfer_for_mint_in_tx(
+                &ctx.accounts.instructions_sysvar.to_account_info(),
+                &GAME_TOKEN_MINT,
+                GAME_TOKEN_DECIMALS,
+                &treasury,
+                &player_key,
+                payment_amount_raw,
+            )?;
+        } else {
+            // Stablecoin path — mint must be in the allowlist
+            let mint_ok = ctx
+                .accounts
+                .stablecoin_config
+                .mints
+                .iter()
+                .any(|m| *m == payment_mint && *m != Pubkey::default());
+            require!(mint_ok, ArcadeError::PaymentMintNotAllowed);
+            // Stablecoins are 6-decimal — raw amount IS the micro-USD value
+            require!(
+                amount_micro_usd == payment_amount_raw,
+                ArcadeError::StablecoinAmountMismatch
+            );
+            verify_spl_transfer_for_mint_in_tx(
+                &ctx.accounts.instructions_sysvar.to_account_info(),
+                &payment_mint,
+                STABLECOIN_DECIMALS,
+                &treasury,
+                &player_key,
+                payment_amount_raw,
+            )?;
+        }
+
+        // ── Profile aggregates (denominated in USD-equivalent) ─────────
         let profile = &mut ctx.accounts.profile;
         if gamer_paid {
             profile.total_spent_gamer_micro = profile
@@ -543,6 +635,8 @@ pub mod gamerplex_arcade {
                 .checked_add(amount_micro_usd)
                 .ok_or(ArcadeError::Overflow)?;
         } else {
+            // Stablecoins AND SOL accrue here as USD-equivalent. Off-chain
+            // consumers disambiguate via PaymentRecorded.payment_mint.
             profile.total_spent_usdc_micro = profile
                 .total_spent_usdc_micro
                 .checked_add(amount_micro_usd)
@@ -554,22 +648,17 @@ pub mod gamerplex_arcade {
             player: player_key,
             category,
             amount_micro_usd,
+            payment_mint,
+            payment_amount_raw,
             payment_tx_sig,
-            gamer_paid,
             external_ref: external_ref.clone(),
         });
 
         // ── Affiliate accrual ──────────────────────────────────────────
-        // Fires only if: (a) referrer is set, (b) tail window not expired,
-        // (c) payment allotment remaining. If any condition fails silently
-        // skip — not an error, just a dead tail.
         let has_active_tail = profile.referrer != Pubkey::default()
             && now < profile.referrer_expires_at
             && profile.referrer_payments_remaining > 0;
         if has_active_tail {
-            // The referrer's PlayerProfile must have been passed and must
-            // match profile.referrer. Enforced by the account constraint
-            // below; we double-check here as defense in depth.
             let referrer_profile = ctx
                 .accounts
                 .referrer_profile
@@ -579,19 +668,14 @@ pub mod gamerplex_arcade {
                 referrer_profile.wallet == profile.referrer,
                 ArcadeError::ReferrerProfileMismatch
             );
-            // Defense: single-hop. We read profile.referrer and accrue to
-            // that one profile. We never walk the chain (never read
-            // referrer_profile.referrer to cascade). Architecturally
-            // single-hop — MLM is impossible.
 
-            // Compute 20% cut (basis points math keeps precision at small amounts).
+            // 20% of USD-equivalent — same math regardless of payment mint
             let cut = amount_micro_usd
                 .checked_mul(AFFILIATE_CUT_BPS)
                 .ok_or(ArcadeError::Overflow)?
                 .checked_div(10_000)
                 .ok_or(ArcadeError::Overflow)?;
 
-            // Accrue on referrer's side.
             referrer_profile.affiliate_earned_accrued_micro = referrer_profile
                 .affiliate_earned_accrued_micro
                 .checked_add(cut)
@@ -600,30 +684,25 @@ pub mod gamerplex_arcade {
                 .affiliate_earned_lifetime_micro
                 .checked_add(cut)
                 .ok_or(ArcadeError::Overflow)?;
-            // First time this player paid anything → increment referred_payers.
-            // (Uses profile.total_spent_* == amount_micro_usd as the "first
-            // payment" signal since we just added `amount` to it above.)
-            let first_payment = if gamer_paid {
-                profile.total_spent_gamer_micro == amount_micro_usd
-                    && profile.total_spent_usdc_micro == 0
-            } else {
-                profile.total_spent_usdc_micro == amount_micro_usd
-                    && profile.total_spent_gamer_micro == 0
-            };
-            if first_payment {
+
+            // First-payment detection — sum across all payment mints
+            // (USD-equiv + $GAME-equiv). True iff this payment is the very
+            // first one and brings the sum exactly equal to amount_micro_usd.
+            let total_spent_after = profile
+                .total_spent_usdc_micro
+                .checked_add(profile.total_spent_gamer_micro)
+                .ok_or(ArcadeError::Overflow)?;
+            if total_spent_after == amount_micro_usd {
                 referrer_profile.affiliate_referred_payers = referrer_profile
                     .affiliate_referred_payers
                     .checked_add(1)
                     .ok_or(ArcadeError::Overflow)?;
             }
 
-            // Track on referred player's side (lifetime audit of what they've
-            // generated for their referrer).
             profile.total_referred_payouts_micro = profile
                 .total_referred_payouts_micro
                 .checked_add(cut)
                 .ok_or(ArcadeError::Overflow)?;
-            // Decrement remaining payments. Once it hits 0, tail is dead forever.
             profile.referrer_payments_remaining =
                 profile.referrer_payments_remaining.saturating_sub(1);
 
@@ -884,6 +963,169 @@ pub mod gamerplex_arcade {
         emit!(StablecoinsUpdated { mints });
         Ok(())
     }
+
+    // ========================================================================
+    // Exchange rates (v1.3 — admin-pushed for SOL + $GAME pricing)
+    // ========================================================================
+
+    /// One-time init of ExchangeRatesConfig PDA. Both rates required, scaled
+    /// ×RATE_SCALE_FACTOR (1e12). Admin-only.
+    pub fn initialize_exchange_rates(
+        ctx: Context<InitializeExchangeRates>,
+        sol_micro_usd_per_lamport: u64,
+        game_micro_usd_per_quark: u64,
+    ) -> Result<()> {
+        require!(sol_micro_usd_per_lamport > 0, ArcadeError::ExchangeRateStale);
+        require!(game_micro_usd_per_quark > 0, ArcadeError::ExchangeRateStale);
+        let now = Clock::get()?.unix_timestamp;
+        let r = &mut ctx.accounts.rates;
+        r.admin = ctx.accounts.admin.key();
+        r.sol_micro_usd_per_lamport = sol_micro_usd_per_lamport;
+        r.game_micro_usd_per_quark = game_micro_usd_per_quark;
+        r.sol_updated_at = now;
+        r.game_updated_at = now;
+        r.bump = ctx.bumps.rates;
+        emit!(ExchangeRatesInitialized {
+            sol_micro_usd_per_lamport,
+            game_micro_usd_per_quark,
+            updated_at: now,
+        });
+        Ok(())
+    }
+
+    /// Update exchange rates. Admin-only, deadline-gated. Pass 0 for either
+    /// rate to leave it unchanged (no `updated_at` touch on the unchanged side).
+    pub fn update_exchange_rates(
+        ctx: Context<UpdateExchangeRates>,
+        sol_micro_usd_per_lamport: u64,
+        game_micro_usd_per_quark: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        check_deadline(deadline)?;
+        let now = Clock::get()?.unix_timestamp;
+        let r = &mut ctx.accounts.rates;
+        let sol_updated = sol_micro_usd_per_lamport > 0;
+        let game_updated = game_micro_usd_per_quark > 0;
+        require!(sol_updated || game_updated, ArcadeError::ExchangeRateStale);
+        if sol_updated {
+            r.sol_micro_usd_per_lamport = sol_micro_usd_per_lamport;
+            r.sol_updated_at = now;
+        }
+        if game_updated {
+            r.game_micro_usd_per_quark = game_micro_usd_per_quark;
+            r.game_updated_at = now;
+        }
+        emit!(ExchangeRatesUpdated {
+            sol_micro_usd_per_lamport: r.sol_micro_usd_per_lamport,
+            game_micro_usd_per_quark: r.game_micro_usd_per_quark,
+            sol_updated,
+            game_updated,
+            updated_at: now,
+        });
+        Ok(())
+    }
+
+    // ========================================================================
+    // Identity — handle + bio (ProfileExtV2 sibling PDA)
+    // ========================================================================
+
+    /// Claim or rename a handle. First call also creates the caller's
+    /// ProfileExtV2 PDA (init_if_needed). Atomic close-old + init-new claim.
+    ///
+    /// Caller responsibilities:
+    ///   * Pass `old_handle_claim = null` on first claim.
+    ///   * Pass the existing HandleClaim PDA on rename.
+    ///   * Handle must match `[a-z0-9_]{3,32}` and not be in RESERVED_HANDLES.
+    pub fn set_handle(ctx: Context<SetHandle>, handle: String) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let player_key = ctx.accounts.player.key();
+
+        validate_handle(&handle)?;
+
+        let ext = &mut ctx.accounts.profile_ext;
+        let fresh_init = ext.wallet == Pubkey::default();
+        if fresh_init {
+            ext.wallet = player_key;
+            ext.profile_version = 2;
+            ext.bio = String::new();
+            ext.created_at = now;
+            ext.bump = ctx.bumps.profile_ext;
+            emit!(ProfileExtOpened {
+                wallet: player_key,
+                created_at: now,
+            });
+        }
+
+        // Reject rename-to-same — same PDA can't be closed and re-init'd in one tx.
+        require!(ext.handle != handle, ArcadeError::HandleUnchanged);
+
+        // If wallet already has a handle, the caller MUST pass the existing
+        // claim so it's closed for rent refund. (Anchor's `close = player`
+        // does the work; we only enforce the requirement here.)
+        if !ext.handle.is_empty() {
+            require!(
+                ctx.accounts.old_handle_claim.is_some(),
+                ArcadeError::OldHandleClaimRequired
+            );
+        }
+        // Conversely, on fresh / no-existing-handle, passing an old claim is
+        // a logic error in the client — reject to avoid closing a stray PDA.
+        if ext.handle.is_empty() {
+            require!(
+                ctx.accounts.old_handle_claim.is_none(),
+                ArcadeError::OldHandleClaimUnexpected
+            );
+        }
+
+        // Initialize the new claim. Account-level `init` constraint already
+        // enforced global uniqueness; this just fills the body.
+        let claim = &mut ctx.accounts.new_handle_claim;
+        claim.wallet = player_key;
+        claim.claimed_at = now;
+        claim.bump = ctx.bumps.new_handle_claim;
+
+        emit!(HandleSet {
+            wallet: player_key,
+            old_handle: ext.handle.clone(),
+            new_handle: handle.clone(),
+            set_at: now,
+        });
+
+        ext.handle = handle;
+        Ok(())
+    }
+
+    /// Set or update bio. First call also creates the caller's ProfileExtV2
+    /// PDA. Empty string allowed (clears the bio).
+    pub fn update_bio(ctx: Context<UpdateBio>, bio: String) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let player_key = ctx.accounts.player.key();
+
+        require!(bio.len() <= MAX_BIO_LEN, ArcadeError::BioTooLong);
+        validate_bio(&bio)?;
+
+        let ext = &mut ctx.accounts.profile_ext;
+        if ext.wallet == Pubkey::default() {
+            ext.wallet = player_key;
+            ext.profile_version = 2;
+            ext.handle = String::new();
+            ext.created_at = now;
+            ext.bump = ctx.bumps.profile_ext;
+            emit!(ProfileExtOpened {
+                wallet: player_key,
+                created_at: now,
+            });
+        }
+
+        let bio_len = bio.len() as u16;
+        ext.bio = bio;
+        emit!(BioUpdated {
+            wallet: player_key,
+            bio_len,
+            updated_at: now,
+        });
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -924,6 +1166,29 @@ pub struct StablecoinConfig {
 impl StablecoinConfig {
     // 8 (disc) + 32 admin + 32*8 mints + 1 bump
     pub const SPACE: usize = 8 + 32 + 32 * MAX_STABLECOIN_SLOTS + 1;
+}
+
+/// Off-chain-pushed exchange rates for SOL and $GAME denominated in USD.
+/// Separate PDA so ArcadeConfig's rent / layout stay undisturbed (same pattern
+/// as StablecoinConfig). Updated by the admin (typically a bot signing every
+/// 15min) via `update_exchange_rates`.
+///
+/// Rates are stored ×1e12 micro-USD per smallest unit (lamport / quark) for
+/// fixed-point precision. Example at SOL=$150:
+///   sol_micro_usd_per_lamport = 150_000_000_000  (= 0.15 micro-USD/lamport × 1e12)
+#[account]
+pub struct ExchangeRatesConfig {
+    pub admin: Pubkey,                  // mirror of ArcadeConfig.admin at init
+    pub sol_micro_usd_per_lamport: u64, // scaled ×RATE_SCALE_FACTOR
+    pub game_micro_usd_per_quark: u64,  // scaled ×RATE_SCALE_FACTOR
+    pub sol_updated_at: i64,
+    pub game_updated_at: i64,
+    pub bump: u8,
+}
+
+impl ExchangeRatesConfig {
+    // 8 disc + 32 admin + 8 + 8 + 8 + 8 + 1 = 73
+    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 8 + 1;
 }
 
 #[account]
@@ -992,6 +1257,54 @@ impl PlayerProfile {
         + 32 + 8 + 1 + 8  // referrer attribution
         + 8 + 8 + 4       // earnings as referrer
         + 1;              // bump
+}
+
+/// Identity-layer extension PDA. Holds handle + bio + version. Created lazily
+/// on first `set_handle` / `update_bio` via `init_if_needed`. Sibling of the
+/// PlayerProfile PDA — matches the StablecoinConfig pattern above. Keeps the
+/// existing PlayerProfile layout / rent / live devnet accounts undisturbed,
+/// and lets non-gameplay surfaces (Sledgit identity-only users) have a handle
+/// without opening a PlayerProfile.
+///
+/// Seeds: [PROFILE_EXT_SEED, wallet.as_ref()]
+#[account]
+pub struct ProfileExtV2 {
+    /// Mirrors the seed. Set once on fresh init; never modified.
+    pub wallet: Pubkey,
+    /// Schema version (currently 2).
+    pub profile_version: u8,
+    /// User-chosen handle. Charset [a-z0-9_], 3-32 bytes. Empty until first
+    /// set_handle. Backed by a HandleClaim PDA at [HANDLE_CLAIM_SEED, handle].
+    pub handle: String,
+    /// Free-form bio. Max 140 UTF-8 bytes. Empty until first update_bio.
+    pub bio: String,
+    /// Unix seconds when this ext was created. Immutable after fresh init.
+    pub created_at: i64,
+    pub bump: u8,
+}
+
+impl ProfileExtV2 {
+    // 8 disc + 32 wallet + 1 ver + (4 + MAX_HANDLE_LEN) handle
+    //   + (4 + MAX_BIO_LEN) bio + 8 created + 1 bump
+    pub const SPACE: usize =
+        8 + 32 + 1 + 4 + MAX_HANDLE_LEN + 4 + MAX_BIO_LEN + 8 + 1;
+}
+
+/// Global uniqueness ledger for handles. Existence at
+/// [HANDLE_CLAIM_SEED, handle.as_bytes()] IS the claim. Closed and re-init'd
+/// on handle change so the rent is recovered.
+#[account]
+pub struct HandleClaim {
+    /// The wallet whose ProfileExtV2 currently owns this handle.
+    pub wallet: Pubkey,
+    /// Unix seconds when claim was created.
+    pub claimed_at: i64,
+    pub bump: u8,
+}
+
+impl HandleClaim {
+    // 8 disc + 32 wallet + 8 claimed_at + 1 bump = 49
+    pub const SPACE: usize = 8 + 32 + 8 + 1;
 }
 
 /// ReplayReceipt — user-owned, transferable certificate of a completed run.
@@ -1194,6 +1507,13 @@ pub struct RecordPayment<'info> {
         bump = referrer_profile.bump,
     )]
     pub referrer_profile: Option<Account<'info, PlayerProfile>>,
+    /// Read-only exchange rates PDA (v1.3+). Required for SOL / $GAME paths;
+    /// always-passed for ix-layout simplicity. Stablecoin paths ignore it.
+    #[account(
+        seeds = [RATES_SEED],
+        bump = rates.bump,
+    )]
+    pub rates: Account<'info, ExchangeRatesConfig>,
     pub player: Signer<'info>,
     /// CHECK: Instructions sysvar — read-only, introspected for the matching
     /// SPL TransferChecked. Address-constrained to the canonical sysvar id.
@@ -1321,6 +1641,104 @@ pub struct UpdateAcceptedStablecoins<'info> {
     pub admin: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeExchangeRates<'info> {
+    /// Admin must match ArcadeConfig.admin.
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = admin @ ArcadeError::AdminOnly,
+    )]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(
+        init,
+        payer = admin,
+        space = ExchangeRatesConfig::SPACE,
+        seeds = [RATES_SEED],
+        bump,
+    )]
+    pub rates: Account<'info, ExchangeRatesConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateExchangeRates<'info> {
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = admin @ ArcadeError::AdminOnly,
+    )]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(
+        mut,
+        seeds = [RATES_SEED],
+        bump = rates.bump,
+    )]
+    pub rates: Account<'info, ExchangeRatesConfig>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(handle: String)]
+pub struct SetHandle<'info> {
+    /// Created on first call (init_if_needed); mutated on rename.
+    /// Seeds bind it to the signer's wallet — no other wallet can ever write here.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = ProfileExtV2::SPACE,
+        seeds = [PROFILE_EXT_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub profile_ext: Account<'info, ProfileExtV2>,
+
+    /// Existing claim for the wallet's current handle. REQUIRED if
+    /// `profile_ext.handle != ""` (rename). Pass `null` on the first claim.
+    /// Closed at end of ix → rent refunded to player.
+    #[account(
+        mut,
+        close = player,
+        seeds = [HANDLE_CLAIM_SEED, profile_ext.handle.as_bytes()],
+        bump = old_handle_claim.bump,
+        constraint = old_handle_claim.wallet == player.key() @ ArcadeError::HandleClaimMismatch,
+    )]
+    pub old_handle_claim: Option<Account<'info, HandleClaim>>,
+
+    /// New claim being created. Init constraint enforces global uniqueness —
+    /// if anyone else already owns this handle, init fails with account-exists.
+    #[account(
+        init,
+        payer = player,
+        space = HandleClaim::SPACE,
+        seeds = [HANDLE_CLAIM_SEED, handle.as_bytes()],
+        bump,
+    )]
+    pub new_handle_claim: Account<'info, HandleClaim>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateBio<'info> {
+    /// Created on first call (init_if_needed); mutated on subsequent calls.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = ProfileExtV2::SPACE,
+        seeds = [PROFILE_EXT_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub profile_ext: Account<'info, ProfileExtV2>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
 // ============================================================================
 // Events
 // ============================================================================
@@ -1380,9 +1798,10 @@ pub struct PaymentRecorded {
     pub game_id: u8,
     pub player: Pubkey,
     pub category: u8,
-    pub amount_micro_usd: u64,
+    pub amount_micro_usd: u64,        // USD-equivalent value claimed
+    pub payment_mint: Pubkey,         // Pubkey::default() = SOL native, else SPL mint
+    pub payment_amount_raw: u64,      // actual lamports or token quarks transferred
     pub payment_tx_sig: [u8; 64],
-    pub gamer_paid: bool,
     pub external_ref: String,
 }
 
@@ -1435,6 +1854,43 @@ pub struct StablecoinsUpdated {
     pub mints: [Pubkey; MAX_STABLECOIN_SLOTS],
 }
 
+#[event]
+pub struct ExchangeRatesInitialized {
+    pub sol_micro_usd_per_lamport: u64,
+    pub game_micro_usd_per_quark: u64,
+    pub updated_at: i64,
+}
+
+#[event]
+pub struct ExchangeRatesUpdated {
+    pub sol_micro_usd_per_lamport: u64,
+    pub game_micro_usd_per_quark: u64,
+    pub sol_updated: bool,
+    pub game_updated: bool,
+    pub updated_at: i64,
+}
+
+#[event]
+pub struct ProfileExtOpened {
+    pub wallet: Pubkey,
+    pub created_at: i64,
+}
+
+#[event]
+pub struct HandleSet {
+    pub wallet: Pubkey,
+    pub old_handle: String,
+    pub new_handle: String,
+    pub set_at: i64,
+}
+
+#[event]
+pub struct BioUpdated {
+    pub wallet: Pubkey,
+    pub bio_len: u16,
+    pub updated_at: i64,
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -1466,62 +1922,9 @@ fn check_deadline(deadline: i64) -> Result<()> {
     Ok(())
 }
 
-/// Confirm the current tx contains an SPL Token `TransferChecked` moving an
-/// accepted stablecoin to the treasury's ATA, authorised by `player`, for at
-/// least `min_amount`. TransferChecked is required (not legacy Transfer)
-/// because it carries the mint in its account list.
-fn verify_stablecoin_transfer_in_tx(
-    instructions_sysvar: &AccountInfo,
-    accepted_mints: &[Pubkey],
-    treasury_wallet: &Pubkey,
-    player: &Pubkey,
-    min_amount: u64,
-) -> Result<()> {
-    let mut i: usize = 0;
-    loop {
-        let ix = match ix_sysvar::load_instruction_at_checked(i, instructions_sysvar) {
-            Ok(ix) => ix,
-            Err(_) => break, // past the last ix
-        };
-        i += 1;
-
-        if ix.program_id != SPL_TOKEN_PROGRAM_ID {
-            continue;
-        }
-        // SPL Token TransferChecked discriminator = 0x0c.
-        if ix.data.is_empty() || ix.data[0] != 0x0c {
-            continue;
-        }
-        // Data layout: [disc:1][amount:u64 LE][decimals:u8] = 10 bytes
-        if ix.data.len() < 10 {
-            continue;
-        }
-        // Accounts layout: [source, mint, destination, authority, ...signers]
-        if ix.accounts.len() < 4 {
-            continue;
-        }
-        let amount = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
-        let mint = ix.accounts[1].pubkey;
-        let destination = ix.accounts[2].pubkey;
-        let authority = ix.accounts[3].pubkey;
-
-        if authority != *player {
-            continue;
-        }
-        if !accepted_mints.iter().any(|m| *m == mint && *m != Pubkey::default()) {
-            continue;
-        }
-        let expected_ata = derive_ata(treasury_wallet, &mint);
-        if destination != expected_ata {
-            continue;
-        }
-        if amount < min_amount {
-            continue;
-        }
-        return Ok(());
-    }
-    err!(ArcadeError::PaymentTransferNotFound)
-}
+// `verify_stablecoin_transfer_in_tx` (v1.2 USDC-only) replaced in v1.3 by
+// `verify_spl_transfer_for_mint_in_tx` (single-mint + decimals enforcement,
+// reused for both stablecoins and $GAME). See below.
 
 /// Require exactly one matching `record_payment` (category + amount) signed
 /// by `player` in the current tx, AND require the current ix to appear at
@@ -1559,12 +1962,14 @@ fn verify_unique_payment_pairing(
         if disc != record_payment_disc {
             continue;
         }
-        // record_payment Anchor args layout (after 8-byte disc):
-        //   category: u8        (1 byte)
+        // record_payment Anchor args layout (after 8-byte disc, v1.3):
+        //   category: u8         (1 byte)
         //   amount_micro_usd: u64 (8 bytes LE)
+        //   payment_mint: Pubkey (32 bytes)        — new in v1.3
+        //   payment_amount_raw: u64 (8 bytes LE)   — new in v1.3
         //   payment_tx_sig: [u8;64] (64 bytes)
-        //   gamer_paid: bool    (1 byte)
         //   external_ref: String (4-byte len prefix + bytes)
+        // Only category + amount are checked here — later fields don't affect pairing.
         if ix.data.len() < 8 + 1 + 8 {
             continue;
         }
@@ -1573,20 +1978,180 @@ fn verify_unique_payment_pairing(
         if category != payment_category || amount != payment_amount {
             continue;
         }
-        // RecordPayment account layout post-hardening:
+        // RecordPayment account layout (v1.3 — `rates` inserted before player):
         //   [0] config, [1] stablecoin_config, [2] game, [3] profile,
         //   [4] wallet, [5] referrer_profile (Option sentinel or account),
-        //   [6] player (Signer), [7] instructions_sysvar
-        if ix.accounts.len() < 7 {
+        //   [6] rates, [7] player (Signer), [8] instructions_sysvar
+        if ix.accounts.len() < 8 {
             continue;
         }
-        if ix.accounts[6].pubkey != *player {
+        if ix.accounts[7].pubkey != *player {
             continue;
         }
         payment_count = payment_count.saturating_add(1);
     }
     require!(payment_count == 1, ArcadeError::RequiredPaymentMissing);
     require!(current_count == 1, ArcadeError::DuplicateIxInTx);
+    Ok(())
+}
+
+// ── v1.3 multi-token payment helpers ────────────────────────────────────
+
+/// Confirm the current tx contains an SPL Token `TransferChecked` of `expected_mint`
+/// to the treasury's ATA, authorised by `player`, for at least `min_amount`.
+/// Verifies the on-wire `decimals` byte matches `expected_decimals` as a second
+/// line of defense against forged-mint attacks (a real TransferChecked carries
+/// the mint's decimal — mismatched ones reject).
+fn verify_spl_transfer_for_mint_in_tx(
+    instructions_sysvar: &AccountInfo,
+    expected_mint: &Pubkey,
+    expected_decimals: u8,
+    treasury_wallet: &Pubkey,
+    player: &Pubkey,
+    min_amount: u64,
+) -> Result<()> {
+    let mut i: usize = 0;
+    loop {
+        let ix = match ix_sysvar::load_instruction_at_checked(i, instructions_sysvar) {
+            Ok(ix) => ix,
+            Err(_) => break,
+        };
+        i += 1;
+        if ix.program_id != SPL_TOKEN_PROGRAM_ID {
+            continue;
+        }
+        if ix.data.is_empty() || ix.data[0] != 0x0c {
+            continue;
+        }
+        // TransferChecked layout: [disc:1][amount:u64 LE][decimals:u8] = 10 bytes
+        if ix.data.len() < 10 {
+            continue;
+        }
+        // Accounts: [source, mint, destination, authority, ...signers]
+        if ix.accounts.len() < 4 {
+            continue;
+        }
+        let amount = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
+        let on_wire_decimals = ix.data[9];
+        let mint = ix.accounts[1].pubkey;
+        let destination = ix.accounts[2].pubkey;
+        let authority = ix.accounts[3].pubkey;
+
+        if mint != *expected_mint {
+            continue;
+        }
+        // Decimal mismatch is a HARD reject (not just skip) — if mint matches
+        // but decimals are forged, the player is signing a malformed tx.
+        require!(on_wire_decimals == expected_decimals, ArcadeError::DecimalsMismatch);
+        if authority != *player {
+            continue;
+        }
+        let expected_ata = derive_ata(treasury_wallet, &mint);
+        if destination != expected_ata {
+            continue;
+        }
+        if amount < min_amount {
+            continue;
+        }
+        return Ok(());
+    }
+    err!(ArcadeError::PaymentTransferNotFound)
+}
+
+/// Confirm the current tx contains a native SOL `SystemProgram::Transfer` from
+/// `player` to `treasury_wallet` for at least `min_amount_lamports`.
+fn verify_sol_transfer_in_tx(
+    instructions_sysvar: &AccountInfo,
+    treasury_wallet: &Pubkey,
+    player: &Pubkey,
+    min_amount_lamports: u64,
+) -> Result<()> {
+    let mut i: usize = 0;
+    loop {
+        let ix = match ix_sysvar::load_instruction_at_checked(i, instructions_sysvar) {
+            Ok(ix) => ix,
+            Err(_) => break,
+        };
+        i += 1;
+        if ix.program_id != solana_program::system_program::ID {
+            continue;
+        }
+        // SystemProgram::Transfer layout: [tag:4 u32 LE = 2][lamports:8 LE] = 12 bytes
+        if ix.data.len() < 12 {
+            continue;
+        }
+        let tag = u32::from_le_bytes(ix.data[0..4].try_into().unwrap());
+        if tag != 2 {
+            continue;
+        }
+        // Accounts: [from (signer), to]
+        if ix.accounts.len() < 2 {
+            continue;
+        }
+        let from = ix.accounts[0].pubkey;
+        let to = ix.accounts[1].pubkey;
+        if from != *player || to != *treasury_wallet {
+            continue;
+        }
+        let amount = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
+        if amount < min_amount_lamports {
+            continue;
+        }
+        return Ok(());
+    }
+    err!(ArcadeError::PaymentTransferNotFound)
+}
+
+/// Convert `amount_micro_usd` to native smallest-unit (lamports or token quarks)
+/// using a scaled fixed-point rate.
+///   smallest_unit = (amount_micro_usd × RATE_SCALE_FACTOR) / rate_scaled
+fn convert_usd_to_raw(amount_micro_usd: u64, rate_scaled: u64) -> Result<u64> {
+    require!(rate_scaled > 0, ArcadeError::ExchangeRateStale);
+    let numerator = (amount_micro_usd as u128)
+        .checked_mul(RATE_SCALE_FACTOR)
+        .ok_or(ArcadeError::Overflow)?;
+    let raw = numerator
+        .checked_div(rate_scaled as u128)
+        .ok_or(ArcadeError::Overflow)?;
+    u64::try_from(raw).map_err(|_| ArcadeError::Overflow.into())
+}
+
+/// Apply a slippage floor: `min_acceptable = expected × (10000 - slippage_bps) / 10000`
+fn apply_slippage_floor(expected: u64, slippage_bps: u64) -> Result<u64> {
+    let num = 10_000_u128
+        .checked_sub(slippage_bps as u128)
+        .ok_or(ArcadeError::Overflow)?;
+    let floor = (expected as u128)
+        .checked_mul(num)
+        .ok_or(ArcadeError::Overflow)?
+        .checked_div(10_000)
+        .ok_or(ArcadeError::Overflow)?;
+    u64::try_from(floor).map_err(|_| ArcadeError::Overflow.into())
+}
+
+/// Validate a handle against charset / length / reserved-list rules.
+/// `[a-z0-9_]{3,32}` and not in RESERVED_HANDLES.
+fn validate_handle(s: &str) -> Result<()> {
+    require!(s.len() >= MIN_HANDLE_LEN, ArcadeError::HandleTooShort);
+    require!(s.len() <= MAX_HANDLE_LEN, ArcadeError::HandleTooLong);
+    require!(
+        s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_')),
+        ArcadeError::HandleInvalidChars
+    );
+    require!(
+        !RESERVED_HANDLES.iter().any(|&r| r == s),
+        ArcadeError::HandleReserved
+    );
+    Ok(())
+}
+
+/// Validate a bio: bytes only — printable + newline allowed; block control
+/// bytes (`<0x20` except `\n`) and DEL (`0x7F`).
+fn validate_bio(s: &str) -> Result<()> {
+    for b in s.bytes() {
+        let ok = b >= 0x20 || b == 0x0A;
+        require!(ok && b != 0x7F, ArcadeError::BioInvalidChars);
+    }
     Ok(())
 }
 
@@ -1707,4 +2272,38 @@ pub enum ArcadeError {
     DeadlineTooFar,
     #[msg("$GAMER-paid actions are not yet supported (v1.3).")]
     GamerPaymentsDisabled,
+    // ── v1.3 multi-token payment errors ──
+    #[msg("Payment mint is not in the allowlist and is not $GAME / SOL.")]
+    PaymentMintNotAllowed,
+    #[msg("Exchange rate is stale — bot has not pushed an update within the staleness window.")]
+    ExchangeRateStale,
+    #[msg("Payment amount is below the quoted minimum (after slippage tolerance).")]
+    PaymentUnderpaid,
+    #[msg("Stablecoin payment amount_micro_usd must equal payment_amount_raw (both 6-decimal).")]
+    StablecoinAmountMismatch,
+    #[msg("TransferChecked decimals byte does not match the expected mint decimals.")]
+    DecimalsMismatch,
+    #[msg("ExchangeRatesConfig PDA missing or admin mismatch.")]
+    RatesConfigMismatch,
+    // ── Identity (ProfileExtV2 + HandleClaim) ──
+    #[msg("Handle too short (min 3 chars).")]
+    HandleTooShort,
+    #[msg("Handle too long (max 32 chars).")]
+    HandleTooLong,
+    #[msg("Handle contains invalid characters (allowed: a-z, 0-9, _).")]
+    HandleInvalidChars,
+    #[msg("Handle is reserved.")]
+    HandleReserved,
+    #[msg("Handle is unchanged — no-op rejected (would conflict with itself in same tx).")]
+    HandleUnchanged,
+    #[msg("Bio too long (max 140 bytes).")]
+    BioTooLong,
+    #[msg("Bio contains forbidden control characters.")]
+    BioInvalidChars,
+    #[msg("HandleClaim wallet does not match the signer.")]
+    HandleClaimMismatch,
+    #[msg("Wallet already has a handle; the existing HandleClaim must be passed for rent refund.")]
+    OldHandleClaimRequired,
+    #[msg("Wallet has no current handle — do not pass an old HandleClaim.")]
+    OldHandleClaimUnexpected,
 }
