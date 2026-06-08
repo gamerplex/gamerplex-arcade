@@ -54,6 +54,7 @@ pub const STABLECOINS_SEED: &[u8] = b"stablecoins";
 pub const PROFILE_EXT_SEED: &[u8] = b"profile-ext";
 pub const HANDLE_CLAIM_SEED: &[u8] = b"handle-claim";
 pub const RATES_SEED: &[u8] = b"rates";
+pub const AFFILIATE_SEED: &[u8] = b"affiliate";
 
 // SPL Token program IDs (used for introspecting token transfers in-tx).
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
@@ -98,6 +99,7 @@ pub const COSMETIC_BITMAP_WORDS: usize = 16;
 // relationship is dead — no more accrual. Bounded leakage.
 pub const AFFILIATE_TAIL_PAYMENTS: u8 = 10;
 pub const AFFILIATE_TAIL_WINDOW_SEC: i64 = 30 * 86_400;
+pub const DEFAULT_AFFILIATE_MIN_ACCRUAL_MICRO: u64 = 150_000;
 // 20% of the payment amount is credited to the referrer. Matches Tournament
 // rake split (20% of protocol fee) documented in AFFILIATE_PROGRAM.md.
 pub const AFFILIATE_CUT_BPS: u64 = 2000; // 2000 basis points = 20%
@@ -655,7 +657,10 @@ pub mod gamerplex_arcade {
         });
 
         // ── Affiliate accrual ──────────────────────────────────────────
-        let has_active_tail = profile.referrer != Pubkey::default()
+        let aff_cfg = &ctx.accounts.affiliate_config;
+        let has_active_tail = !aff_cfg.disabled
+            && amount_micro_usd >= aff_cfg.min_accrual_micro
+            && profile.referrer != Pubkey::default()
             && now < profile.referrer_expires_at
             && profile.referrer_payments_remaining > 0;
         if has_active_tail {
@@ -1026,6 +1031,52 @@ pub mod gamerplex_arcade {
     }
 
     // ========================================================================
+    // Affiliate hardening (v1.3 — kill switch + min-accrual threshold)
+    // ========================================================================
+
+    pub fn initialize_affiliate_config(
+        ctx: Context<InitializeAffiliateConfig>,
+        min_accrual_micro: u64,
+    ) -> Result<()> {
+        let min = if min_accrual_micro == 0 { DEFAULT_AFFILIATE_MIN_ACCRUAL_MICRO } else { min_accrual_micro };
+        require!(min >= MIN_PAYMENT_MICRO_USD, ArcadeError::AffiliateMinAccrualTooLow);
+        require!(min <= MAX_PAYMENT_MICRO_USD, ArcadeError::AffiliateMinAccrualTooLow);
+        let a = &mut ctx.accounts.affiliate_config;
+        a.admin = ctx.accounts.admin.key();
+        a.disabled = false;
+        a.min_accrual_micro = min;
+        a.bump = ctx.bumps.affiliate_config;
+        emit!(AffiliateConfigInitialized { disabled: false, min_accrual_micro: min });
+        Ok(())
+    }
+
+    pub fn set_affiliate_enabled(
+        ctx: Context<UpdateAffiliateConfig>,
+        enabled: bool,
+        deadline: i64,
+    ) -> Result<()> {
+        check_deadline(deadline)?;
+        let a = &mut ctx.accounts.affiliate_config;
+        a.disabled = !enabled;
+        emit!(AffiliateConfigUpdated { disabled: a.disabled, min_accrual_micro: a.min_accrual_micro });
+        Ok(())
+    }
+
+    pub fn set_affiliate_min_accrual(
+        ctx: Context<UpdateAffiliateConfig>,
+        min_micro: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        check_deadline(deadline)?;
+        require!(min_micro >= MIN_PAYMENT_MICRO_USD, ArcadeError::AffiliateMinAccrualTooLow);
+        require!(min_micro <= MAX_PAYMENT_MICRO_USD, ArcadeError::AffiliateMinAccrualTooLow);
+        let a = &mut ctx.accounts.affiliate_config;
+        a.min_accrual_micro = min_micro;
+        emit!(AffiliateConfigUpdated { disabled: a.disabled, min_accrual_micro: a.min_accrual_micro });
+        Ok(())
+    }
+
+    // ========================================================================
     // Identity — handle + bio (ProfileExtV2 sibling PDA)
     // ========================================================================
 
@@ -1189,6 +1240,24 @@ pub struct ExchangeRatesConfig {
 impl ExchangeRatesConfig {
     // 8 disc + 32 admin + 8 + 8 + 8 + 8 + 1 = 73
     pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 8 + 1;
+}
+
+/// Affiliate hardening config. Sibling PDA at seed ["affiliate"]. Two knobs:
+///   - disabled: kill-switch — if true, record_payment skips affiliate accrual
+///   - min_accrual_micro: payments below this threshold don't accrue
+/// Both are admin-tunable via deadline-gated ix. Same pattern as
+/// StablecoinConfig / ExchangeRatesConfig — sibling PDA, no realloc.
+#[account]
+pub struct AffiliateConfig {
+    pub admin: Pubkey,
+    pub disabled: bool,
+    pub min_accrual_micro: u64,
+    pub bump: u8,
+}
+
+impl AffiliateConfig {
+    // 8 disc + 32 admin + 1 disabled + 8 min + 1 bump = 50
+    pub const SPACE: usize = 8 + 32 + 1 + 8 + 1;
 }
 
 #[account]
@@ -1472,48 +1541,31 @@ pub struct SubmitScore<'info> {
 
 #[derive(Accounts)]
 pub struct RecordPayment<'info> {
-    #[account(
-        seeds = [CONFIG_SEED],
-        bump = config.bump,
-    )]
-    pub config: Account<'info, ArcadeConfig>,
-    #[account(
-        seeds = [STABLECOINS_SEED],
-        bump = stablecoin_config.bump,
-    )]
-    pub stablecoin_config: Account<'info, StablecoinConfig>,
-    #[account(
-        seeds = [GAME_SEED, &[game.game_id]],
-        bump = game.bump,
-    )]
-    pub game: Account<'info, Game>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, ArcadeConfig>>,
+    #[account(seeds = [STABLECOINS_SEED], bump = stablecoin_config.bump)]
+    pub stablecoin_config: Box<Account<'info, StablecoinConfig>>,
+    #[account(seeds = [GAME_SEED, &[game.game_id]], bump = game.bump)]
+    pub game: Box<Account<'info, Game>>,
     #[account(
         mut,
         seeds = [PROFILE_SEED, player.key().as_ref()],
         bump = profile.bump,
         has_one = wallet @ ArcadeError::ProfileOwnerMismatch,
     )]
-    pub profile: Account<'info, PlayerProfile>,
+    pub profile: Box<Account<'info, PlayerProfile>>,
     /// CHECK: the profile's owner — address-constrained above.
     pub wallet: AccountInfo<'info>,
-    /// Referrer's PlayerProfile — required if profile.referrer is set and
-    /// the tail window is active. Seeds constrain it to the expected wallet
-    /// (no mismatched profile can be passed). Optional because many players
-    /// have no referrer and the instruction skips affiliate logic in that
-    /// case.
     #[account(
         mut,
         seeds = [PROFILE_SEED, profile.referrer.as_ref()],
         bump = referrer_profile.bump,
     )]
-    pub referrer_profile: Option<Account<'info, PlayerProfile>>,
-    /// Read-only exchange rates PDA (v1.3+). Required for SOL / $GAME paths;
-    /// always-passed for ix-layout simplicity. Stablecoin paths ignore it.
-    #[account(
-        seeds = [RATES_SEED],
-        bump = rates.bump,
-    )]
-    pub rates: Account<'info, ExchangeRatesConfig>,
+    pub referrer_profile: Option<Box<Account<'info, PlayerProfile>>>,
+    #[account(seeds = [RATES_SEED], bump = rates.bump)]
+    pub rates: Box<Account<'info, ExchangeRatesConfig>>,
+    #[account(seeds = [AFFILIATE_SEED], bump = affiliate_config.bump)]
+    pub affiliate_config: Box<Account<'info, AffiliateConfig>>,
     pub player: Signer<'info>,
     /// CHECK: Instructions sysvar — read-only, introspected for the matching
     /// SPL TransferChecked. Address-constrained to the canonical sysvar id.
@@ -1677,6 +1729,26 @@ pub struct UpdateExchangeRates<'info> {
         bump = rates.bump,
     )]
     pub rates: Account<'info, ExchangeRatesConfig>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeAffiliateConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(init, payer = admin, space = AffiliateConfig::SPACE, seeds = [AFFILIATE_SEED], bump)]
+    pub affiliate_config: Account<'info, AffiliateConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateAffiliateConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(mut, seeds = [AFFILIATE_SEED], bump = affiliate_config.bump)]
+    pub affiliate_config: Account<'info, AffiliateConfig>,
     pub admin: Signer<'info>,
 }
 
@@ -1871,6 +1943,18 @@ pub struct ExchangeRatesUpdated {
 }
 
 #[event]
+pub struct AffiliateConfigInitialized {
+    pub disabled: bool,
+    pub min_accrual_micro: u64,
+}
+
+#[event]
+pub struct AffiliateConfigUpdated {
+    pub disabled: bool,
+    pub min_accrual_micro: u64,
+}
+
+#[event]
 pub struct ProfileExtOpened {
     pub wallet: Pubkey,
     pub created_at: i64,
@@ -1978,14 +2062,14 @@ fn verify_unique_payment_pairing(
         if category != payment_category || amount != payment_amount {
             continue;
         }
-        // RecordPayment account layout (v1.3 — `rates` inserted before player):
+        // RecordPayment account layout (v1.3 + affiliate hardening):
         //   [0] config, [1] stablecoin_config, [2] game, [3] profile,
         //   [4] wallet, [5] referrer_profile (Option sentinel or account),
-        //   [6] rates, [7] player (Signer), [8] instructions_sysvar
-        if ix.accounts.len() < 8 {
+        //   [6] rates, [7] affiliate_config, [8] player (Signer), [9] instructions_sysvar
+        if ix.accounts.len() < 9 {
             continue;
         }
-        if ix.accounts[7].pubkey != *player {
+        if ix.accounts[8].pubkey != *player {
             continue;
         }
         payment_count = payment_count.saturating_add(1);
@@ -2285,6 +2369,8 @@ pub enum ArcadeError {
     DecimalsMismatch,
     #[msg("ExchangeRatesConfig PDA missing or admin mismatch.")]
     RatesConfigMismatch,
+    #[msg("Affiliate min_accrual_micro out of bounds (must be >= MIN_PAYMENT_MICRO_USD and <= MAX_PAYMENT_MICRO_USD).")]
+    AffiliateMinAccrualTooLow,
     // ── Identity (ProfileExtV2 + HandleClaim) ──
     #[msg("Handle too short (min 3 chars).")]
     HandleTooShort,

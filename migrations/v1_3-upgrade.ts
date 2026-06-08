@@ -143,8 +143,27 @@ async function main() {
     .rpc();
   console.log(`  ✓ stablecoins updated: ${sig2.slice(0, 20)}…`);
 
-  // ── Step 3: register_game(5, flipball) ─────────────────────────────────
-  console.log("\nStep 3: register FLIPBALL");
+  // ── Step 3: initialize_affiliate_config ────────────────────────────────
+  console.log("\nStep 3: AffiliateConfig (kill-switch + min-accrual)");
+  const [affiliateAddr] = pda([Buffer.from("affiliate")]);
+  const affInfo = await conn.getAccountInfo(affiliateAddr);
+  if (!affInfo) {
+    const sigAff = await (program.methods as any)
+      .initializeAffiliateConfig(new BN(150_000))
+      .accounts({
+        config: configAddr,
+        affiliateConfig: affiliateAddr,
+        admin: admin.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log(`  ✓ affiliate config initialised (min=$0.15): ${sigAff.slice(0, 20)}…`);
+  } else {
+    console.log("  → affiliate config already exists, skipping");
+  }
+
+  // ── Step 4: register_game(5, flipball) ─────────────────────────────────
+  console.log("\nStep 4: register FLIPBALL");
   const [flipballGame] = pda([Buffer.from("game"), Buffer.from([FLIPBALL_GAME_ID])]);
   const existingGame = await conn.getAccountInfo(flipballGame);
   if (!existingGame) {
@@ -165,12 +184,15 @@ async function main() {
   // ── Summary ────────────────────────────────────────────────────────────
   const rates: any = await (program.account as any).exchangeRatesConfig.fetch(ratesAddr);
   const sc: any = await (program.account as any).stablecoinConfig.fetch(stablecoinsAddr);
+  const aff: any = await (program.account as any).affiliateConfig.fetch(affiliateAddr);
   const fb: any = await (program.account as any).game.fetch(flipballGame);
   console.log("\n=== State ===");
   console.log("rates.sol_micro_usd_per_lamport :", rates.solMicroUsdPerLamport.toString());
   console.log("rates.game_micro_usd_per_quark  :", rates.gameMicroUsdPerQuark.toString());
   console.log("rates.sol_updated_at            :", new Date(Number(rates.solUpdatedAt) * 1000).toISOString());
   console.log("stablecoins                     :", sc.mints.filter((m: PublicKey) => !m.equals(PublicKey.default)).map((m: PublicKey) => m.toBase58()).join(", "));
+  console.log("affiliate.disabled              :", aff.disabled);
+  console.log("affiliate.min_accrual_micro     :", aff.minAccrualMicro.toString());
   console.log("flipball game_id                :", fb.gameId);
   console.log("flipball slug                   :", fb.slug);
   console.log(`\n✓ v1.3 upgrade complete on ${MAINNET ? "MAINNET" : "devnet"}`);
