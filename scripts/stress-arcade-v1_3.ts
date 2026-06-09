@@ -53,6 +53,8 @@ const RPC =
 const KEYPAIR_PATH =
   process.env.KEYPAIR_PATH || (process.env.HOME || "~") + "/.config/solana/id.json";
 const SKIP_T5 = !!process.env.SKIP_T5;
+const SKIP_T6 = !!process.env.SKIP_T6;
+const SKIP_T7 = !!process.env.SKIP_T7;
 const T4_ROUNDS = Number(process.env.T4_ROUNDS || 5);
 
 // Per-network constants
@@ -82,6 +84,7 @@ const pda = (seeds: (Buffer | Uint8Array)[]) =>
 const configPda = () => pda([Buffer.from("config")]);
 const stablecoinsPda = () => pda([Buffer.from("stablecoins")]);
 const ratesPda = () => pda([Buffer.from("rates")]);
+const affiliatePda = () => pda([Buffer.from("affiliate")]);
 const gamePda = (id: number) => pda([Buffer.from("game"), Buffer.from([id])]);
 const profilePda = (wallet: PublicKey) =>
   pda([Buffer.from("profile"), wallet.toBuffer()]);
@@ -133,6 +136,7 @@ async function buildRecordPaymentIx(
     paymentAmountRaw: BN;
     externalRef: string;
     gameId: number;
+    referrer?: PublicKey;
   },
 ) {
   return (program.methods as any)
@@ -150,12 +154,76 @@ async function buildRecordPaymentIx(
       game: gamePda(args.gameId),
       profile: profilePda(player),
       wallet: player,
-      referrerProfile: null,
+      referrerProfile: args.referrer ? profilePda(args.referrer) : null,
       rates: ratesPda(),
+      affiliateConfig: affiliatePda(),
       player,
       instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
     })
     .instruction();
+}
+
+// Open a player profile. Idempotent: skips if already open.
+async function ensureProfile(
+  program: Program,
+  connection: Connection,
+  signer: Keypair,
+  referrer: PublicKey,
+) {
+  const profileAddr = profilePda(signer.publicKey);
+  const info = await connection.getAccountInfo(profileAddr);
+  if (info) return;
+  const refProfile = referrer.equals(PublicKey.default) ? null : profilePda(referrer);
+  const ix = await (program.methods as any)
+    .openPlayerProfile(referrer)
+    .accounts({
+      config: configPda(),
+      profile: profileAddr,
+      referrerProfile: refProfile,
+      player: signer.publicKey,
+      systemProgram: SystemProgram.programId,
+    })
+    .instruction();
+  await sendAndConfirmTransaction(connection, new Transaction().add(ix), [signer]);
+}
+
+// Fund an ephemeral wallet with SOL from the main keypair.
+async function fundFromMain(
+  connection: Connection,
+  funder: Keypair,
+  recipient: PublicKey,
+  lamports: number,
+) {
+  const tx = new Transaction().add(SystemProgram.transfer({
+    fromPubkey: funder.publicKey, toPubkey: recipient, lamports,
+  }));
+  await sendAndConfirmTransaction(connection, tx, [funder]);
+}
+
+// Transfer SPL tokens from main wallet to ephemeral wallet's ATA.
+async function transferSplToEphemeral(
+  connection: Connection,
+  funder: Keypair,
+  recipient: PublicKey,
+  mint: PublicKey,
+  amountRaw: bigint,
+  decimals: number,
+) {
+  const fromAta = getAssociatedTokenAddressSync(mint, funder.publicKey);
+  const toAta = getAssociatedTokenAddressSync(mint, recipient);
+  const tx = new Transaction();
+  if (!(await connection.getAccountInfo(toAta))) {
+    tx.add(createAssociatedTokenAccountInstruction(funder.publicKey, toAta, recipient, mint));
+  }
+  tx.add(createTransferCheckedInstruction(
+    fromAta, mint, toAta, funder.publicKey, amountRaw, decimals, [], TOKEN_PROGRAM_ID,
+  ));
+  await sendAndConfirmTransaction(connection, tx, [funder]);
+}
+
+// Parse logs for an emitted event name (works for Anchor `emit!` events).
+function logsContainEvent(logs: string[], name: string): boolean {
+  return logs.some((l) => l.includes(name));
 }
 
 async function buildSubmitScoreIx(
@@ -471,6 +539,168 @@ async function main() {
                                     by cfg(feature="mainnet") compile-time constant.`);
   }
 
+  // ── T6: affiliate flow (min-threshold + accrual + kill-switch) ──────
+  const t6Results: Result[] = [];
+  if (!SKIP_T6) {
+    console.log(`\n── T6: affiliate (min-threshold + accrual + kill-switch) ──`);
+
+    // Ephemeral referrer + player so the test is self-contained and reusable.
+    // Referrer needs profile (rent ~0.0014 SOL). Player needs SOL fees + USDC
+    // for 4 payments at up to $0.15 each = $0.60.
+    const refKp = Keypair.generate();
+    const playerKp = Keypair.generate();
+    console.log(`    refr:   ${refKp.publicKey.toBase58().slice(0, 12)}…`);
+    console.log(`    player: ${playerKp.publicKey.toBase58().slice(0, 12)}…`);
+
+    try {
+      // Fund both wallets from main keypair
+      await fundFromMain(connection, kp, refKp.publicKey, 5_000_000);     // 0.005 SOL — profile rent
+      await fundFromMain(connection, kp, playerKp.publicKey, 20_000_000); // 0.02 SOL — fees + token rent
+      await transferSplToEphemeral(connection, kp, playerKp.publicKey, USDC_MINT, 800_000n, STABLE_DECIMALS); // $0.80 USDC
+      await sleep(800);
+
+      // Open profiles (referrer has no referrer; player references refKp)
+      await ensureProfile(program, connection, refKp, PublicKey.default);
+      await ensureProfile(program, connection, playerKp, refKp.publicKey);
+      await sleep(600);
+
+      // Read current affiliate config (admin = main kp)
+      const affCfg: any = await (program.account as any).affiliateConfig.fetch(affiliatePda());
+      const minMicro = Number(affCfg.minAccrualMicro.toString());
+      console.log(`    affiliate min: $${(minMicro / 1_000_000).toFixed(4)}, disabled: ${affCfg.disabled}`);
+
+      const payWithRef = async (amountMicro: number, label: string, expectAccrual: boolean) => {
+        const t0 = Date.now();
+        try {
+          const tx = new Transaction();
+          const fromAta = getAssociatedTokenAddressSync(USDC_MINT, playerKp.publicKey);
+          const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+          if (!(await connection.getAccountInfo(toAta))) {
+            tx.add(createAssociatedTokenAccountInstruction(playerKp.publicKey, toAta, treasury, USDC_MINT));
+          }
+          tx.add(createTransferCheckedInstruction(
+            fromAta, USDC_MINT, toAta, playerKp.publicKey,
+            BigInt(amountMicro), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+          ));
+          tx.add(await buildRecordPaymentIx(program, playerKp.publicKey, {
+            category: CATEGORY_SCORE_COMMIT,
+            amountMicroUsd: new BN(amountMicro),
+            paymentMint: USDC_MINT,
+            paymentAmountRaw: new BN(amountMicro),
+            externalRef: "",
+            gameId: FLIPBALL_GAME_ID,
+            referrer: refKp.publicKey,
+          }));
+          tx.add(await buildSubmitScoreIx(program, playerKp.publicKey, FLIPBALL_GAME_ID, 1000));
+          const sig = await sendAndConfirmTransaction(connection, tx, [playerKp]);
+          await sleep(1200);
+          const txInfo = await connection.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+          const logs = txInfo?.meta?.logMessages || [];
+          const sawAccrual = logsContainEvent(logs, "AffiliateAccrued");
+          const ok = sawAccrual === expectAccrual;
+          t6Results.push({
+            ok,
+            sig,
+            err: ok ? undefined : `expected accrual=${expectAccrual} got=${sawAccrual}`,
+            ms: Date.now() - t0,
+          });
+          printRow(label, t6Results[t6Results.length - 1]);
+        } catch (e: any) {
+          t6Results.push({ ok: false, err: (e?.message || String(e)).slice(0, 120) });
+          printRow(label, t6Results[t6Results.length - 1]);
+        }
+      };
+
+      // T6a — pay $0.05 (below $0.15 threshold) → NO AffiliateAccrued
+      await payWithRef(50_000, "T6a $0.05 below-threshold (no accrual)", false);
+      await sleep(800);
+
+      // T6b — pay $0.15 (at threshold) → AffiliateAccrued fires
+      await payWithRef(150_000, "T6b $0.15 at-threshold (accrual fires)", true);
+      await sleep(800);
+
+      // T6c — kill switch: disable affiliate, then $0.15 with referrer → NO accrual
+      const nowSec = Math.floor(Date.now() / 1000);
+      const deadline = nowSec + 300;
+      try {
+        const killTx = new Transaction().add(
+          await (program.methods as any)
+            .setAffiliateEnabled(false, new BN(deadline))
+            .accounts({ affiliateConfig: affiliatePda(), admin: kp.publicKey })
+            .instruction()
+        );
+        await sendAndConfirmTransaction(connection, killTx, [kp]);
+        console.log("    [T6c] kill-switch flipped OFF");
+      } catch (e: any) {
+        console.log(`    [T6c] kill-switch failed: ${e?.message?.slice(0, 100)}`);
+      }
+      await sleep(600);
+      await payWithRef(150_000, "T6c $0.15 with kill-switch (no accrual)", false);
+      await sleep(800);
+
+      // T6d — restore kill switch ON, verify accrual resumes
+      try {
+        const restoreTx = new Transaction().add(
+          await (program.methods as any)
+            .setAffiliateEnabled(true, new BN(Math.floor(Date.now() / 1000) + 300))
+            .accounts({ affiliateConfig: affiliatePda(), admin: kp.publicKey })
+            .instruction()
+        );
+        await sendAndConfirmTransaction(connection, restoreTx, [kp]);
+        console.log("    [T6d] kill-switch restored ON");
+      } catch (e: any) {
+        console.log(`    [T6d] kill-switch restore failed: ${e?.message?.slice(0, 100)}`);
+      }
+      await sleep(600);
+      await payWithRef(150_000, "T6d $0.15 kill-switch restored (accrual)", true);
+
+      // Verify referrer profile accrued total
+      const refProfile: any = await (program.account as any).playerProfile.fetch(profilePda(refKp.publicKey));
+      console.log(`    referrer accrued total: ${refProfile.affiliateAccruedMicro?.toString() || "(field missing)"}`);
+    } catch (e: any) {
+      console.error(`    T6 setup failed: ${e?.message?.slice(0, 200)}`);
+      t6Results.push({ ok: false, err: "setup failed" });
+    }
+  }
+
+  // ── T7: cross-game (same wallet pays for game_id=1 AND game_id=5) ───
+  const t7Results: Result[] = [];
+  if (!SKIP_T7) {
+    console.log(`\n── T7: cross-game state isolation (cyber-snake + flipball) ──`);
+    const cyberSnakeRegistered = await connection.getAccountInfo(gamePda(CYBER_SNAKE_GAME_ID));
+    if (!cyberSnakeRegistered) {
+      console.log("    [T7] SKIPPED — cyber-snake (game_id=1) not registered on this network");
+    } else {
+      for (const [label, gameId] of [["T7a cyber-snake", CYBER_SNAKE_GAME_ID], ["T7b flipball", FLIPBALL_GAME_ID]] as const) {
+        const t0 = Date.now();
+        try {
+          const tx = new Transaction();
+          const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+          const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+          tx.add(createTransferCheckedInstruction(
+            fromAta, USDC_MINT, toAta, kp.publicKey,
+            BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+          ));
+          tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+            category: CATEGORY_SCORE_COMMIT,
+            amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
+            paymentMint: USDC_MINT,
+            paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
+            externalRef: "",
+            gameId,
+          }));
+          tx.add(await buildSubmitScoreIx(program, kp.publicKey, gameId, 1234));
+          const sig = await sendAndConfirmTransaction(connection, tx, [kp]);
+          t7Results.push({ ok: true, sig, ms: Date.now() - t0 });
+        } catch (e: any) {
+          t7Results.push({ ok: false, err: (e?.message || String(e)).slice(0, 120) });
+        }
+        printRow(label, t7Results[t7Results.length - 1]);
+        await sleep(800);
+      }
+    }
+  }
+
   // ── Summary ─────────────────────────────────────────────────────────
   const sum = (rs: Result[]) => {
     const ok = rs.filter((r) => r.ok).length;
@@ -483,12 +713,16 @@ async function main() {
   console.log("═══════════════════════════════════");
   console.log(`T4 (multi-mint happy):  ${sum(t4Results)}`);
   if (!SKIP_T5) console.log(`T5 (negative tests):    ${sum(t5Results)}`);
+  if (!SKIP_T6) console.log(`T6 (affiliate flow):    ${sum(t6Results)}`);
+  if (!SKIP_T7) console.log(`T7 (cross-game):        ${sum(t7Results)}`);
 
   const allOk =
     t4Results.every((r) => r.ok) &&
-    (SKIP_T5 || t5Results.every((r) => r.ok));
+    (SKIP_T5 || t5Results.every((r) => r.ok)) &&
+    (SKIP_T6 || t6Results.every((r) => r.ok)) &&
+    (SKIP_T7 || t7Results.every((r) => r.ok));
   console.log(allOk
-    ? "\n✅ v1.3 GATE PASSED — multi-token + negative defenses verified"
+    ? "\n✅ v1.3 GATE PASSED — multi-token + affiliate + cross-game + negative defenses verified"
     : "\n❌ v1.3 GATE FAILED — fix errors above before mainnet");
   process.exit(allOk ? 0 : 1);
 }
