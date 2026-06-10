@@ -166,7 +166,14 @@ pub const MAX_RATE_STALENESS_GAME_SEC: i64 = 24 * 3_600;  // 24 hours
 
 // Tolerance on rate-converted payments. Frontend must overpay slightly
 // (see RATE_OVERPAY_BPS in client.ts) to stay above this floor.
-pub const PAYMENT_SLIPPAGE_BPS: u64 = 100;  // 1%
+// v1.4: tightened 1% -> 0.5%. Bot push cadence + TWAP smooths to <0.3% in
+// normal markets, so 0.5% gives 67% headroom while shrinking the MEV window.
+pub const PAYMENT_SLIPPAGE_BPS: u64 = 50;  // 0.5%
+
+// v1.4: $GAME save-score discount. 20% off the fixed-tier USD price when
+// paying with $GAME (Score / Verified / Replay / cNFT categories). Makes
+// $GAME a real utility token — without this, $GAME has no save-flow utility.
+pub const GAME_DISCOUNT_BPS: u64 = 2_000; // 20%
 
 // Rates are stored scaled ×1e12 (micro-USD per smallest unit). At SOL=$150,
 // 1 lamport = 0.15 micro-USD → store as 150_000_000_000. Division on use.
@@ -551,16 +558,19 @@ pub mod gamerplex_arcade {
         require!(category <= CATEGORY_CNFT_WRAP, ArcadeError::InvalidPaymentCategory);
         require!(external_ref.len() <= MAX_EXTERNAL_REF_LEN, ArcadeError::ExternalRefTooLong);
 
-        // Enforce exact Gamerplex fees for fixed-price tiers (USD-denominated).
-        // Categories 0/1/3 (Continue/Powerup/Cosmetic) are client-priced per game.
-        if category == CATEGORY_SCORE_COMMIT {
-            require!(amount_micro_usd == SCORE_COMMIT_MICRO_USD, ArcadeError::InvalidScoreCommitAmount);
-        } else if category == CATEGORY_VERIFIED_COMMIT {
-            require!(amount_micro_usd == VERIFIED_COMMIT_MICRO_USD, ArcadeError::InvalidVerifiedAmount);
-        } else if category == CATEGORY_REPLAY_RECEIPT {
-            require!(amount_micro_usd == REPLAY_RECEIPT_MICRO_USD, ArcadeError::InvalidReplayReceiptAmount);
-        } else if category == CATEGORY_CNFT_WRAP {
-            require!(amount_micro_usd == CNFT_WRAP_MICRO_USD, ArcadeError::InvalidCnftWrapAmount);
+        // v1.4: mint-aware fixed amounts. $GAME pays 80% of the list price for
+        // each fixed-tier category (Score / Verified / Replay / cNFT). All
+        // other mints (USDC/USDT/USDF/SOL) pay full list price. Categories
+        // 0/1/3 (Continue/Powerup/Cosmetic) remain client-priced.
+        let required = required_amount(category, &payment_mint)?;
+        if required > 0 && amount_micro_usd != required {
+            return Err(match category {
+                CATEGORY_SCORE_COMMIT => ArcadeError::InvalidScoreCommitAmount.into(),
+                CATEGORY_VERIFIED_COMMIT => ArcadeError::InvalidVerifiedAmount.into(),
+                CATEGORY_REPLAY_RECEIPT => ArcadeError::InvalidReplayReceiptAmount.into(),
+                CATEGORY_CNFT_WRAP => ArcadeError::InvalidCnftWrapAmount.into(),
+                _ => ArcadeError::InvalidPaymentCategory.into(),
+            });
         }
         require!(amount_micro_usd >= MIN_PAYMENT_MICRO_USD, ArcadeError::PaymentBelowMin);
         require!(amount_micro_usd <= MAX_PAYMENT_MICRO_USD, ArcadeError::PaymentAboveMax);
@@ -589,7 +599,10 @@ pub mod gamerplex_arcade {
                 payment_amount_raw,
             )?;
         } else if payment_mint == GAME_TOKEN_MINT {
-            // $GAME path (20% discount already applied frontend-side to amount_micro_usd)
+            // $GAME path. v1.4: discount enforced by required_amount() check above,
+            // so amount_micro_usd is already the discounted value (e.g. $0.04 for
+            // a $0.05 ScoreCommit). Slippage check below validates token amount
+            // covers that discounted USD value.
             require!(
                 now.saturating_sub(rates.game_updated_at) <= MAX_RATE_STALENESS_GAME_SEC,
                 ArcadeError::ExchangeRateStale
@@ -2201,6 +2214,33 @@ fn convert_usd_to_raw(amount_micro_usd: u64, rate_scaled: u64) -> Result<u64> {
 }
 
 /// Apply a slippage floor: `min_acceptable = expected × (10000 - slippage_bps) / 10000`
+/// v1.4: compute the required `amount_micro_usd` for a fixed-tier category,
+/// applying the $GAME 20% discount when paying with $GAME. Returns 0 for
+/// variable-amount categories (Continue / Powerup / Cosmetic).
+fn required_amount(category: u8, payment_mint: &Pubkey) -> Result<u64> {
+    let base = match category {
+        CATEGORY_SCORE_COMMIT => SCORE_COMMIT_MICRO_USD,
+        CATEGORY_VERIFIED_COMMIT => VERIFIED_COMMIT_MICRO_USD,
+        CATEGORY_REPLAY_RECEIPT => REPLAY_RECEIPT_MICRO_USD,
+        CATEGORY_CNFT_WRAP => CNFT_WRAP_MICRO_USD,
+        _ => return Ok(0),
+    };
+    if *payment_mint == GAME_TOKEN_MINT {
+        // base * (10_000 - GAME_DISCOUNT_BPS) / 10_000.
+        // Max safe input: 500_000 * 8_000 = 4×10⁹, well under u64::MAX.
+        let num = (10_000_u64)
+            .checked_sub(GAME_DISCOUNT_BPS)
+            .ok_or(ArcadeError::Overflow)?;
+        let discounted = (base as u128)
+            .checked_mul(num as u128)
+            .ok_or(ArcadeError::Overflow)?
+            / 10_000_u128;
+        Ok(discounted as u64)
+    } else {
+        Ok(base)
+    }
+}
+
 fn apply_slippage_floor(expected: u64, slippage_bps: u64) -> Result<u64> {
     let num = 10_000_u128
         .checked_sub(slippage_bps as u128)

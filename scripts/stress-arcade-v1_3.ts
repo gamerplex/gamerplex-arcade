@@ -73,10 +73,14 @@ const GAME_DECIMALS = 10;
 const STABLE_DECIMALS = 6;
 const RATE_SCALE_FACTOR = 1_000_000_000_000n;
 
-const SCORE_COMMIT_MICRO_USD = 50_000; // $0.05
+const SCORE_COMMIT_MICRO_USD = 50_000;     // $0.05 (category 2)
+const VERIFIED_COMMIT_MICRO_USD = 150_000; // $0.15 (category 4, matches affiliate threshold)
 const CATEGORY_SCORE_COMMIT = 2;
+const CATEGORY_VERIFIED_COMMIT = 4;
 const FLIPBALL_GAME_ID = 5;
 const CYBER_SNAKE_GAME_ID = 1;
+// Dummy Arweave-format external_ref (43 base64url chars) for VerifiedCommit
+const DUMMY_AR_REF = "abcdef1234567890ABCDEF1234567890_-abc123XYZW";
 
 // PDAs
 const pda = (seeds: (Buffer | Uint8Array)[]) =>
@@ -320,12 +324,14 @@ async function main() {
             lamports: Number(lamports),
           }));
         } else if (mint.equals(GAME_MINT)) {
-          // 20% discount applied frontend-side
-          const discounted = Math.floor((base * 80) / 100);
-          const expected = convertUsdToRaw(discounted, BigInt(rates.gameMicroUsdPerQuark.toString()));
+          // v1.4: contract enforces amount_micro_usd == base * 0.8 for $GAME (the
+          // user-facing 20% discount). Both declared USD and actual token amount
+          // shrink to 80% of standard.
+          const discountedUsd = Math.floor((base * 80) / 100);
+          const expected = convertUsdToRaw(discountedUsd, BigInt(rates.gameMicroUsdPerQuark.toString()));
           const quarks = applyOverpay(expected);
           paymentAmountRaw = new BN(quarks.toString());
-          amountMicroUsdToRecord = discounted;
+          amountMicroUsdToRecord = discountedUsd;
           const fromAta = getAssociatedTokenAddressSync(GAME_MINT, kp.publicKey);
           const toAta = getAssociatedTokenAddressSync(GAME_MINT, treasury);
           const toInfo = await connection.getAccountInfo(toAta);
@@ -413,15 +419,15 @@ async function main() {
       await sleep(800);
     }
 
-    // T5d — $GAME underpaid past slippage
+    // T5d — $GAME underpaid past slippage (v1.4: amount_micro_usd uses discounted)
     {
       const t0 = Date.now();
       try {
         const tx = new Transaction();
         const base = SCORE_COMMIT_MICRO_USD;
-        const discounted = Math.floor((base * 80) / 100);
-        const expected = convertUsdToRaw(discounted, BigInt(rates.gameMicroUsdPerQuark.toString()));
-        const underpayQuarks = (expected * 90n) / 100n; // 10% underpay
+        const discountedUsd = Math.floor((base * 80) / 100);
+        const expected = convertUsdToRaw(discountedUsd, BigInt(rates.gameMicroUsdPerQuark.toString()));
+        const underpayQuarks = (expected * 90n) / 100n; // 10% underpay (past 0.5% slippage)
         const fromAta = getAssociatedTokenAddressSync(GAME_MINT, kp.publicKey);
         const toAta = getAssociatedTokenAddressSync(GAME_MINT, treasury);
         tx.add(createTransferCheckedInstruction(
@@ -430,7 +436,7 @@ async function main() {
         ));
         tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
           category: CATEGORY_SCORE_COMMIT,
-          amountMicroUsd: new BN(discounted),
+          amountMicroUsd: new BN(discountedUsd),
           paymentMint: GAME_MINT,
           paymentAmountRaw: new BN(underpayQuarks.toString()),
           externalRef: "",
@@ -569,7 +575,7 @@ async function main() {
       const minMicro = Number(affCfg.minAccrualMicro.toString());
       console.log(`    affiliate min: $${(minMicro / 1_000_000).toFixed(4)}, disabled: ${affCfg.disabled}`);
 
-      const payWithRef = async (amountMicro: number, label: string, expectAccrual: boolean) => {
+      const payWithRef = async (amountMicro: number, category: number, label: string, expectAccrual: boolean) => {
         const t0 = Date.now();
         try {
           const tx = new Transaction();
@@ -583,15 +589,18 @@ async function main() {
             BigInt(amountMicro), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
           ));
           tx.add(await buildRecordPaymentIx(program, playerKp.publicKey, {
-            category: CATEGORY_SCORE_COMMIT,
+            category,
             amountMicroUsd: new BN(amountMicro),
             paymentMint: USDC_MINT,
             paymentAmountRaw: new BN(amountMicro),
-            externalRef: "",
+            externalRef: category === CATEGORY_VERIFIED_COMMIT ? DUMMY_AR_REF : "",
             gameId: FLIPBALL_GAME_ID,
             referrer: refKp.publicKey,
           }));
-          tx.add(await buildSubmitScoreIx(program, playerKp.publicKey, FLIPBALL_GAME_ID, 1000));
+          // Skip submit_score for VerifiedCommit since it has its own session-replay flow
+          if (category === CATEGORY_SCORE_COMMIT) {
+            tx.add(await buildSubmitScoreIx(program, playerKp.publicKey, FLIPBALL_GAME_ID, 1000));
+          }
           const sig = await sendAndConfirmTransaction(connection, tx, [playerKp]);
           await sleep(1200);
           const txInfo = await connection.getParsedTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
@@ -611,15 +620,15 @@ async function main() {
         }
       };
 
-      // T6a — pay $0.05 (below $0.15 threshold) → NO AffiliateAccrued
-      await payWithRef(50_000, "T6a $0.05 below-threshold (no accrual)", false);
+      // T6a — $0.05 ScoreCommit (below threshold) → NO AffiliateAccrued
+      await payWithRef(SCORE_COMMIT_MICRO_USD, CATEGORY_SCORE_COMMIT, "T6a $0.05 below-threshold (no accrual)", false);
       await sleep(800);
 
-      // T6b — pay $0.15 (at threshold) → AffiliateAccrued fires
-      await payWithRef(150_000, "T6b $0.15 at-threshold (accrual fires)", true);
+      // T6b — $0.15 VerifiedCommit (at threshold) → AffiliateAccrued fires
+      await payWithRef(VERIFIED_COMMIT_MICRO_USD, CATEGORY_VERIFIED_COMMIT, "T6b $0.15 at-threshold (accrual fires)", true);
       await sleep(800);
 
-      // T6c — kill switch: disable affiliate, then $0.15 with referrer → NO accrual
+      // T6c — kill switch off, then $0.15 VerifiedCommit → NO accrual
       const nowSec = Math.floor(Date.now() / 1000);
       const deadline = nowSec + 300;
       try {
@@ -635,7 +644,7 @@ async function main() {
         console.log(`    [T6c] kill-switch failed: ${e?.message?.slice(0, 100)}`);
       }
       await sleep(600);
-      await payWithRef(150_000, "T6c $0.15 with kill-switch (no accrual)", false);
+      await payWithRef(VERIFIED_COMMIT_MICRO_USD, CATEGORY_VERIFIED_COMMIT, "T6c $0.15 with kill-switch (no accrual)", false);
       await sleep(800);
 
       // T6d — restore kill switch ON, verify accrual resumes
@@ -652,7 +661,7 @@ async function main() {
         console.log(`    [T6d] kill-switch restore failed: ${e?.message?.slice(0, 100)}`);
       }
       await sleep(600);
-      await payWithRef(150_000, "T6d $0.15 kill-switch restored (accrual)", true);
+      await payWithRef(VERIFIED_COMMIT_MICRO_USD, CATEGORY_VERIFIED_COMMIT, "T6d $0.15 kill-switch restored (accrual)", true);
 
       // Verify referrer profile accrued total
       const refProfile: any = await (program.account as any).playerProfile.fetch(profilePda(refKp.publicKey));
@@ -663,41 +672,49 @@ async function main() {
     }
   }
 
-  // ── T7: cross-game (same wallet pays for game_id=1 AND game_id=5) ───
+  // ── T7: ALL games via shared arcade client (cross-game state isolation) ──
   const t7Results: Result[] = [];
   if (!SKIP_T7) {
-    console.log(`\n── T7: cross-game state isolation (cyber-snake + flipball) ──`);
-    const cyberSnakeRegistered = await connection.getAccountInfo(gamePda(CYBER_SNAKE_GAME_ID));
-    if (!cyberSnakeRegistered) {
-      console.log("    [T7] SKIPPED — cyber-snake (game_id=1) not registered on this network");
-    } else {
-      for (const [label, gameId] of [["T7a cyber-snake", CYBER_SNAKE_GAME_ID], ["T7b flipball", FLIPBALL_GAME_ID]] as const) {
-        const t0 = Date.now();
-        try {
-          const tx = new Transaction();
-          const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
-          const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
-          tx.add(createTransferCheckedInstruction(
-            fromAta, USDC_MINT, toAta, kp.publicKey,
-            BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
-          ));
-          tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
-            category: CATEGORY_SCORE_COMMIT,
-            amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
-            paymentMint: USDC_MINT,
-            paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
-            externalRef: "",
-            gameId,
-          }));
-          tx.add(await buildSubmitScoreIx(program, kp.publicKey, gameId, 1234));
-          const sig = await sendAndConfirmTransaction(connection, tx, [kp]);
-          t7Results.push({ ok: true, sig, ms: Date.now() - t0 });
-        } catch (e: any) {
-          t7Results.push({ ok: false, err: (e?.message || String(e)).slice(0, 120) });
-        }
-        printRow(label, t7Results[t7Results.length - 1]);
-        await sleep(800);
+    console.log(`\n── T7: all 4 active games × USDC save-score (same wallet) ──`);
+    const allGames: Array<{ id: number; slug: string }> = [
+      { id: 1, slug: "cyber-snake" },
+      { id: 3, slug: "magic-chess" },
+      { id: 4, slug: "blockwords" },
+      { id: 5, slug: "flipball" },
+    ];
+    for (const game of allGames) {
+      const registered = await connection.getAccountInfo(gamePda(game.id));
+      if (!registered) {
+        console.log(`    [T7] game_id=${game.id} (${game.slug}) NOT registered on this network — SKIPPED`);
+        t7Results.push({ ok: false, err: "not registered" });
+        printRow(`T7 ${game.slug} (id=${game.id})`, t7Results[t7Results.length - 1]);
+        continue;
       }
+      const t0 = Date.now();
+      try {
+        const tx = new Transaction();
+        const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+        const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+        tx.add(createTransferCheckedInstruction(
+          fromAta, USDC_MINT, toAta, kp.publicKey,
+          BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+        ));
+        tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+          category: CATEGORY_SCORE_COMMIT,
+          amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
+          paymentMint: USDC_MINT,
+          paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
+          externalRef: "",
+          gameId: game.id,
+        }));
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, game.id, 4321));
+        const sig = await sendAndConfirmTransaction(connection, tx, [kp]);
+        t7Results.push({ ok: true, sig, ms: Date.now() - t0 });
+      } catch (e: any) {
+        t7Results.push({ ok: false, err: (e?.message || String(e)).slice(0, 120) });
+      }
+      printRow(`T7 ${game.slug} (id=${game.id})`, t7Results[t7Results.length - 1]);
+      await sleep(700);
     }
   }
 
