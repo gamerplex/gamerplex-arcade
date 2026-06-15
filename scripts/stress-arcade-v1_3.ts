@@ -55,6 +55,7 @@ const KEYPAIR_PATH =
 const SKIP_T5 = !!process.env.SKIP_T5;
 const SKIP_T6 = !!process.env.SKIP_T6;
 const SKIP_T7 = !!process.env.SKIP_T7;
+const SKIP_T8 = !!process.env.SKIP_T8;
 const T4_ROUNDS = Number(process.env.T4_ROUNDS || 5);
 
 // Per-network constants
@@ -75,6 +76,7 @@ const RATE_SCALE_FACTOR = 1_000_000_000_000n;
 
 const SCORE_COMMIT_MICRO_USD = 50_000;     // $0.05 (category 2)
 const VERIFIED_COMMIT_MICRO_USD = 150_000; // $0.15 (category 4, matches affiliate threshold)
+const CATEGORY_CONTINUE = 0;
 const CATEGORY_SCORE_COMMIT = 2;
 const CATEGORY_VERIFIED_COMMIT = 4;
 const FLIPBALL_GAME_ID = 5;
@@ -255,6 +257,7 @@ async function buildSubmitScoreIx(
       wallet: player,
       player,
       memoProgram: SPL_MEMO_ID,
+      instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
     })
     .instruction();
 }
@@ -718,6 +721,141 @@ async function main() {
     }
   }
 
+  // ── T8: P0-2 payment-gate negative tests (each must FAIL) ────────────
+  const t8Results: Result[] = [];
+  if (!SKIP_T8) {
+    console.log(`\n── T8: P0-2 submit_score payment-gate (each must FAIL) ──`);
+
+    // T8a — submit_score WITHOUT paired record_payment
+    {
+      const t0 = Date.now();
+      try {
+        const tx = new Transaction();
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, FLIPBALL_GAME_ID, 1234));
+        await sendAndConfirmTransaction(connection, tx, [kp]);
+        t8Results.push({ ok: false, err: "EXPECTED FAILURE but tx succeeded" });
+      } catch (e: any) {
+        const msg = (e?.message || "").toLowerCase();
+        const ok = msg.includes("requiredpaymentmissing") || msg.includes("payment");
+        t8Results.push({
+          ok,
+          err: ok ? "RequiredPaymentMissing (expected)" : "wrong error: " + (e?.message || "").slice(0, 80),
+          ms: Date.now() - t0,
+        });
+      }
+      printRow("T8a no payment", t8Results[t8Results.length - 1]);
+      await sleep(800);
+    }
+
+    // T8b — submit_score with WRONG category (CONTINUE instead of SCORE_COMMIT)
+    {
+      const t0 = Date.now();
+      try {
+        const tx = new Transaction();
+        const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+        const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+        tx.add(createTransferCheckedInstruction(
+          fromAta, USDC_MINT, toAta, kp.publicKey,
+          BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+        ));
+        tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+          category: CATEGORY_CONTINUE,            // wrong — submit_score wants SCORE_COMMIT
+          amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
+          paymentMint: USDC_MINT,
+          paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
+          externalRef: "",
+          gameId: FLIPBALL_GAME_ID,
+        }));
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, FLIPBALL_GAME_ID, 1234));
+        await sendAndConfirmTransaction(connection, tx, [kp]);
+        t8Results.push({ ok: false, err: "EXPECTED FAILURE but tx succeeded" });
+      } catch (e: any) {
+        const msg = (e?.message || "").toLowerCase();
+        const ok = msg.includes("requiredpaymentmissing") || msg.includes("payment");
+        t8Results.push({
+          ok,
+          err: ok ? "RequiredPaymentMissing (expected — wrong category)" : "wrong error: " + (e?.message || "").slice(0, 80),
+          ms: Date.now() - t0,
+        });
+      }
+      printRow("T8b wrong category", t8Results[t8Results.length - 1]);
+      await sleep(800);
+    }
+
+    // T8c — submit_score with WRONG amount ($0.04 instead of $0.05)
+    {
+      const t0 = Date.now();
+      try {
+        const wrongAmount = SCORE_COMMIT_MICRO_USD - 10_000; // $0.04
+        const tx = new Transaction();
+        const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+        const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+        tx.add(createTransferCheckedInstruction(
+          fromAta, USDC_MINT, toAta, kp.publicKey,
+          BigInt(wrongAmount), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+        ));
+        tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+          category: CATEGORY_SCORE_COMMIT,
+          amountMicroUsd: new BN(wrongAmount),     // wrong — sysvar check is exact-match
+          paymentMint: USDC_MINT,
+          paymentAmountRaw: new BN(wrongAmount),
+          externalRef: "",
+          gameId: FLIPBALL_GAME_ID,
+        }));
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, FLIPBALL_GAME_ID, 1234));
+        await sendAndConfirmTransaction(connection, tx, [kp]);
+        t8Results.push({ ok: false, err: "EXPECTED FAILURE but tx succeeded" });
+      } catch (e: any) {
+        const msg = (e?.message || "").toLowerCase();
+        const ok = msg.includes("requiredpaymentmissing") ||
+                   msg.includes("payment") ||
+                   msg.includes("amount");
+        t8Results.push({
+          ok,
+          err: ok ? "RequiredPaymentMissing (expected — wrong amount)" : "wrong error: " + (e?.message || "").slice(0, 80),
+          ms: Date.now() - t0,
+        });
+      }
+      printRow("T8c wrong amount", t8Results[t8Results.length - 1]);
+      await sleep(800);
+    }
+
+    // T8d — TWO submit_score in same tx with ONE record_payment → DuplicateIxInTx
+    {
+      const t0 = Date.now();
+      try {
+        const tx = new Transaction();
+        const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+        const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+        tx.add(createTransferCheckedInstruction(
+          fromAta, USDC_MINT, toAta, kp.publicKey,
+          BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+        ));
+        tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+          category: CATEGORY_SCORE_COMMIT,
+          amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
+          paymentMint: USDC_MINT,
+          paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
+          externalRef: "",
+          gameId: FLIPBALL_GAME_ID,
+        }));
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, FLIPBALL_GAME_ID, 1111));
+        tx.add(await buildSubmitScoreIx(program, kp.publicKey, FLIPBALL_GAME_ID, 2222)); // 2nd
+        await sendAndConfirmTransaction(connection, tx, [kp]);
+        t8Results.push({ ok: false, err: "EXPECTED FAILURE but tx succeeded" });
+      } catch (e: any) {
+        const msg = (e?.message || "").toLowerCase();
+        const ok = msg.includes("duplicateixintx") || msg.includes("duplicate");
+        t8Results.push({
+          ok,
+          err: ok ? "DuplicateIxInTx (expected)" : "wrong error: " + (e?.message || "").slice(0, 80),
+          ms: Date.now() - t0,
+        });
+      }
+      printRow("T8d duplicate submit", t8Results[t8Results.length - 1]);
+    }
+  }
+
   // ── Summary ─────────────────────────────────────────────────────────
   const sum = (rs: Result[]) => {
     const ok = rs.filter((r) => r.ok).length;
@@ -732,12 +870,14 @@ async function main() {
   if (!SKIP_T5) console.log(`T5 (negative tests):    ${sum(t5Results)}`);
   if (!SKIP_T6) console.log(`T6 (affiliate flow):    ${sum(t6Results)}`);
   if (!SKIP_T7) console.log(`T7 (cross-game):        ${sum(t7Results)}`);
+  if (!SKIP_T8) console.log(`T8 (P0-2 payment gate): ${sum(t8Results)}`);
 
   const allOk =
     t4Results.every((r) => r.ok) &&
     (SKIP_T5 || t5Results.every((r) => r.ok)) &&
     (SKIP_T6 || t6Results.every((r) => r.ok)) &&
-    (SKIP_T7 || t7Results.every((r) => r.ok));
+    (SKIP_T7 || t7Results.every((r) => r.ok)) &&
+    (SKIP_T8 || t8Results.every((r) => r.ok));
   console.log(allOk
     ? "\n✅ v1.3 GATE PASSED — multi-token + affiliate + cross-game + negative defenses verified"
     : "\n❌ v1.3 GATE FAILED — fix errors above before mainnet");

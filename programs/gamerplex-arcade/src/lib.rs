@@ -55,6 +55,10 @@ pub const PROFILE_EXT_SEED: &[u8] = b"profile-ext";
 pub const HANDLE_CLAIM_SEED: &[u8] = b"handle-claim";
 pub const RATES_SEED: &[u8] = b"rates";
 pub const AFFILIATE_SEED: &[u8] = b"affiliate";
+pub const SESSION_SEED: &[u8] = b"session";
+
+pub const MIN_SESSION_LIFETIME_SEC: u32 = 60;
+pub const MAX_SESSION_LIFETIME_SEC: u32 = 7 * 86_400;
 
 // SPL Token program IDs (used for introspecting token transfers in-tx).
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
@@ -421,6 +425,38 @@ pub mod gamerplex_arcade {
         require!(meta.len() <= MAX_META_LEN, ArcadeError::MetaTooLong);
         require!(duration_sec > 0, ArcadeError::InvalidDuration);
 
+        verify_unique_payment_pairing(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            CATEGORY_SCORE_COMMIT,
+            SCORE_COMMIT_MICRO_USD,
+            crate::instruction::SubmitScore::DISCRIMINATOR,
+            crate::instruction::RecordPayment::DISCRIMINATOR,
+            &ctx.accounts.player.key(),
+        )?;
+
+        // P0-3: daily + challenge variants must be backed by a server-issued
+        // Session PDA. Casual / random play is unaffected.
+        if variant.starts_with("daily") || variant.starts_with("challenge") {
+            let session = ctx
+                .accounts
+                .session
+                .as_ref()
+                .ok_or(ArcadeError::SessionRequired)?;
+            require_keys_eq!(
+                session.player,
+                ctx.accounts.player.key(),
+                ArcadeError::SessionOwnerMismatch
+            );
+            require_eq!(
+                session.game_id,
+                ctx.accounts.game.game_id,
+                ArcadeError::SessionGameMismatch
+            );
+            require!(session.seed == session_seed, ArcadeError::SessionSeedMismatch);
+            let now = Clock::get()?.unix_timestamp;
+            require!(now < session.expires_at, ArcadeError::SessionExpired);
+        }
+
         let game = &mut ctx.accounts.game;
         let profile = &mut ctx.accounts.profile;
         let cfg = &mut ctx.accounts.config;
@@ -510,6 +546,46 @@ pub mod gamerplex_arcade {
             season: cfg.current_season,
         });
 
+        Ok(())
+    }
+
+    /// Open a play Session bound to a player + game, carrying a server-issued
+    /// random seed. The resolver service-account funds + signs this — the
+    /// player does not see a wallet popup. The returned PDA is then passed as
+    /// the `session` account on submit_score; for daily / challenge variants
+    /// the on-chain seed must match the seed actually used in play.
+    ///
+    /// Without this binding, daily / challenge leaderboards are grindable —
+    /// any client could refresh until it got a lucky deterministic seed, then
+    /// submit only the best score. The Session PDA makes the seed an on-chain
+    /// commitment that's auditable forever.
+    pub fn open_session(
+        ctx: Context<OpenSession>,
+        nonce: u64,
+        game_id: u8,
+        seed: [u8; 32],
+        lifetime_sec: u32,
+    ) -> Result<()> {
+        require!(
+            lifetime_sec >= MIN_SESSION_LIFETIME_SEC
+                && lifetime_sec <= MAX_SESSION_LIFETIME_SEC,
+            ArcadeError::InvalidSessionLifetime
+        );
+        let now = Clock::get()?.unix_timestamp;
+        let session = &mut ctx.accounts.session;
+        session.player = ctx.accounts.player.key();
+        session.game_id = game_id;
+        session.seed = seed;
+        session.nonce = nonce;
+        session.created_at = now;
+        session.expires_at = now + lifetime_sec as i64;
+        session.bump = ctx.bumps.session;
+        emit!(SessionOpened {
+            player: session.player,
+            game_id,
+            nonce,
+            expires_at: session.expires_at,
+        });
         Ok(())
     }
 
@@ -1439,6 +1515,31 @@ impl ReplayReceipt {
         + 32 + 1 + 32 + 1;
 }
 
+/// Session — server-issued play binding for grind-resistant daily challenges.
+///
+/// Opened by the resolver on the player's behalf (server funds rent + signs the
+/// open_session tx). Carries a cryptographically random seed that is then used
+/// to drive game RNG. At submit_score time, if the variant is "daily*" or
+/// "challenge*", the submitted seed MUST match this PDA's seed exactly, and
+/// the session must not be expired. Without this binding, a client could
+/// refresh until the daily seed produced a lucky board, then submit only the
+/// best score (seed grinding attack).
+#[account]
+pub struct Session {
+    pub player: Pubkey,         // who can submit using this session
+    pub game_id: u8,            // bound at open; submit must match
+    pub seed: [u8; 32],         // the random seed the player must use
+    pub nonce: u64,             // server-chosen, makes the PDA unique
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub bump: u8,
+}
+
+impl Session {
+    // 8 disc + 32 player + 1 game_id + 32 seed + 8 nonce + 8 created + 8 expires + 1 bump = 98
+    pub const SPACE: usize = 8 + 32 + 1 + 32 + 8 + 8 + 8 + 1;
+}
+
 // ============================================================================
 // Accounts
 // ============================================================================
@@ -1550,6 +1651,32 @@ pub struct SubmitScore<'info> {
     /// CHECK: the SPL Memo program — we CPI into it with the GPX5 string.
     #[account(address = SPL_MEMO_ID)]
     pub memo_program: AccountInfo<'info>,
+    /// CHECK: Instructions sysvar — read-only, introspected for the matching
+    /// record_payment(SCORE_COMMIT).
+    #[account(address = ix_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+    /// Optional — REQUIRED when variant starts with "daily" or "challenge"
+    /// (P0-3 grinding defense). Server opens this via open_session.
+    pub session: Option<Account<'info, Session>>,
+}
+
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct OpenSession<'info> {
+    #[account(
+        init,
+        payer = funder,
+        space = Session::SPACE,
+        seeds = [SESSION_SEED, player.key().as_ref(), &nonce.to_le_bytes()],
+        bump,
+    )]
+    pub session: Account<'info, Session>,
+    /// CHECK: the player the session binds to. Not required to sign — server
+    /// opens on their behalf so player UX stays one-click.
+    pub player: AccountInfo<'info>,
+    #[account(mut)]
+    pub funder: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1876,6 +2003,14 @@ pub struct ScoreSubmitted {
     pub powerups_used: u8,
     pub duration_sec: u32,
     pub season: u16,
+}
+
+#[event]
+pub struct SessionOpened {
+    pub player: Pubkey,
+    pub game_id: u8,
+    pub nonce: u64,
+    pub expires_at: i64,
 }
 
 #[event]
@@ -2432,4 +2567,16 @@ pub enum ArcadeError {
     OldHandleClaimRequired,
     #[msg("Wallet has no current handle — do not pass an old HandleClaim.")]
     OldHandleClaimUnexpected,
+    #[msg("Daily / challenge variant requires a Session PDA.")]
+    SessionRequired,
+    #[msg("Session was opened for a different player.")]
+    SessionOwnerMismatch,
+    #[msg("Session was opened for a different game_id.")]
+    SessionGameMismatch,
+    #[msg("Submitted session_seed does not match the on-chain Session seed.")]
+    SessionSeedMismatch,
+    #[msg("Session has expired (clock > expires_at).")]
+    SessionExpired,
+    #[msg("Invalid session lifetime (must be MIN..=MAX seconds).")]
+    InvalidSessionLifetime,
 }
