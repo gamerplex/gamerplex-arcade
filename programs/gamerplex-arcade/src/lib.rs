@@ -29,6 +29,11 @@ use anchor_lang::solana_program::{
 use anchor_lang::Discriminator;
 use solana_security_txt::security_txt;
 
+// Program ID is compile-time per network (mirrors GAME_TOKEN_MINT below).
+// Build mainnet artifact with `anchor build -- --features mainnet`.
+#[cfg(feature = "mainnet")]
+declare_id!("GAMEbo12FjDbrobsgy8RbPhMs5kAQtJce3pARCi1cakV");
+#[cfg(not(feature = "mainnet"))]
 declare_id!("4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t");
 
 security_txt! {

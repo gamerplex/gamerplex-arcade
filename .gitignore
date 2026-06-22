@@ -32,3 +32,6 @@ docs-internal/
 node_modules/
 **/node_modules/
 
+
+# infra/secret ceremony script — never commit (GCP project, secret names, vault)
+scripts/mainnet-launch.sh

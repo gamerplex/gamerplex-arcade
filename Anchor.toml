@@ -8,6 +8,9 @@ gamerplex_arcade = "4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t"
 [programs.devnet]
 gamerplex_arcade = "4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t"
 
+[programs.mainnet]
+gamerplex_arcade = "GAMEbo12FjDbrobsgy8RbPhMs5kAQtJce3pARCi1cakV"
+
 [registry]
 url = "https://api.apr.dev"
 
