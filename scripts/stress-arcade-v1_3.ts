@@ -91,6 +91,7 @@ const configPda = () => pda([Buffer.from("config")]);
 const stablecoinsPda = () => pda([Buffer.from("stablecoins")]);
 const ratesPda = () => pda([Buffer.from("rates")]);
 const affiliatePda = () => pda([Buffer.from("affiliate")]);
+const paymentsPda = () => pda([Buffer.from("payments")]);
 const gamePda = (id: number) => pda([Buffer.from("game"), Buffer.from([id])]);
 const profilePda = (wallet: PublicKey) =>
   pda([Buffer.from("profile"), wallet.toBuffer()]);
@@ -163,6 +164,7 @@ async function buildRecordPaymentIx(
       referrerProfile: args.referrer ? profilePda(args.referrer) : null,
       rates: ratesPda(),
       affiliateConfig: affiliatePda(),
+      paymentsConfig: paymentsPda(),
       player,
       instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
     })
@@ -258,6 +260,9 @@ async function buildSubmitScoreIx(
       player,
       memoProgram: SPL_MEMO_ID,
       instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+      // P0-3: session is Optional<Account> — required only for daily/challenge
+      // variants. "v1_3-stress" doesn't need one, but Anchor needs it explicit.
+      session: null,
     })
     .instruction();
 }
@@ -714,6 +719,7 @@ async function main() {
         const sig = await sendAndConfirmTransaction(connection, tx, [kp]);
         t7Results.push({ ok: true, sig, ms: Date.now() - t0 });
       } catch (e: any) {
+        if (process.env.DEBUG_LOGS) console.error(`\n[T7 ${game.slug}] FULL ERROR:`, e?.message, "\nLOGS:\n" + ((e?.logs || []).join("\n") || "(no logs prop)"));
         t7Results.push({ ok: false, err: (e?.message || String(e)).slice(0, 120) });
       }
       printRow(`T7 ${game.slug} (id=${game.id})`, t7Results[t7Results.length - 1]);
@@ -856,6 +862,89 @@ async function main() {
     }
   }
 
+  // ── T9: global payments kill-switch (PaymentsConfig) ──────────────────
+  const t9Results: Result[] = [];
+  const SKIP_T9 = process.env.SKIP_T9 === "1";
+  if (!SKIP_T9) {
+    console.log(`\n── T9: payments kill-switch (pause blocks record_payment) ──`);
+    const setPaused = async (paused: boolean, signer = kp) => {
+      const tx = new Transaction().add(
+        await (program.methods as any)
+          .setPaymentsPaused(paused, new BN(Math.floor(Date.now() / 1000) + 300))
+          .accounts({ config: configPda(), paymentsConfig: paymentsPda(), admin: signer.publicKey })
+          .instruction()
+      );
+      tx.feePayer = kp.publicKey;
+      const signers = signer.publicKey.equals(kp.publicKey) ? [kp] : [kp, signer];
+      return sendAndConfirmTransaction(connection, tx, signers);
+    };
+    const trySave = async () => {
+      const tx = new Transaction();
+      const fromAta = getAssociatedTokenAddressSync(USDC_MINT, kp.publicKey);
+      const toAta = getAssociatedTokenAddressSync(USDC_MINT, treasury);
+      tx.add(createTransferCheckedInstruction(
+        fromAta, USDC_MINT, toAta, kp.publicKey,
+        BigInt(SCORE_COMMIT_MICRO_USD), STABLE_DECIMALS, [], TOKEN_PROGRAM_ID,
+      ));
+      tx.add(await buildRecordPaymentIx(program, kp.publicKey, {
+        category: CATEGORY_SCORE_COMMIT,
+        amountMicroUsd: new BN(SCORE_COMMIT_MICRO_USD),
+        paymentMint: USDC_MINT,
+        paymentAmountRaw: new BN(SCORE_COMMIT_MICRO_USD),
+        externalRef: "",
+        gameId: FLIPBALL_GAME_ID,
+      }));
+      return sendAndConfirmTransaction(connection, tx, [kp]);
+    };
+
+    // T9a — pause → record_payment rejected with PaymentsPaused
+    try {
+      await setPaused(true);
+      await sleep(600);
+      try {
+        await trySave();
+        t9Results.push({ ok: false, err: "EXPECTED FAILURE but save succeeded while paused" });
+      } catch (e: any) {
+        const m = (e?.message || "").toLowerCase();
+        const ok = m.includes("paymentspaused") || m.includes("paused");
+        t9Results.push({ ok, err: ok ? "PaymentsPaused (expected)" : "wrong error: " + (e?.message || "").slice(0, 80) });
+      }
+    } catch (e: any) {
+      t9Results.push({ ok: false, err: "pause failed: " + (e?.message || "").slice(0, 80) });
+    }
+    printRow("T9a paused → reject", t9Results[t9Results.length - 1]);
+    await sleep(600);
+
+    // T9b — unpause → save succeeds again
+    try {
+      await setPaused(false);
+      await sleep(600);
+      await trySave();
+      t9Results.push({ ok: true, err: "save ok after unpause" });
+    } catch (e: any) {
+      t9Results.push({ ok: false, err: "save failed after unpause: " + (e?.message || "").slice(0, 80) });
+    }
+    printRow("T9b unpaused → ok", t9Results[t9Results.length - 1]);
+    await sleep(600);
+
+    // T9c — non-admin set_payments_paused → AdminOnly
+    {
+      const badKp = Keypair.generate();
+      try {
+        await setPaused(true, badKp);
+        t9Results.push({ ok: false, err: "EXPECTED FAILURE but non-admin paused" });
+        await setPaused(false).catch(() => {});
+      } catch (e: any) {
+        const m = (e?.message || "").toLowerCase();
+        const ok = m.includes("adminonly") || m.includes("admin") || m.includes("constraint");
+        t9Results.push({ ok, err: ok ? "AdminOnly (expected)" : "wrong error: " + (e?.message || "").slice(0, 80) });
+      }
+      printRow("T9c non-admin → reject", t9Results[t9Results.length - 1]);
+    }
+    // safety: leave unpaused
+    await setPaused(false).catch(() => {});
+  }
+
   // ── Summary ─────────────────────────────────────────────────────────
   const sum = (rs: Result[]) => {
     const ok = rs.filter((r) => r.ok).length;
@@ -871,13 +960,15 @@ async function main() {
   if (!SKIP_T6) console.log(`T6 (affiliate flow):    ${sum(t6Results)}`);
   if (!SKIP_T7) console.log(`T7 (cross-game):        ${sum(t7Results)}`);
   if (!SKIP_T8) console.log(`T8 (P0-2 payment gate): ${sum(t8Results)}`);
+  if (!SKIP_T9) console.log(`T9 (payments killswitch):${sum(t9Results)}`);
 
   const allOk =
     t4Results.every((r) => r.ok) &&
     (SKIP_T5 || t5Results.every((r) => r.ok)) &&
     (SKIP_T6 || t6Results.every((r) => r.ok)) &&
     (SKIP_T7 || t7Results.every((r) => r.ok)) &&
-    (SKIP_T8 || t8Results.every((r) => r.ok));
+    (SKIP_T8 || t8Results.every((r) => r.ok)) &&
+    (SKIP_T9 || t9Results.every((r) => r.ok));
   console.log(allOk
     ? "\n✅ v1.3 GATE PASSED — multi-token + affiliate + cross-game + negative defenses verified"
     : "\n❌ v1.3 GATE FAILED — fix errors above before mainnet");
