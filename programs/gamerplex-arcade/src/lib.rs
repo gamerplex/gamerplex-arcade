@@ -61,6 +61,7 @@ pub const HANDLE_CLAIM_SEED: &[u8] = b"handle-claim";
 pub const RATES_SEED: &[u8] = b"rates";
 pub const AFFILIATE_SEED: &[u8] = b"affiliate";
 pub const SESSION_SEED: &[u8] = b"session";
+pub const PAYMENTS_SEED: &[u8] = b"payments";
 
 pub const MIN_SESSION_LIFETIME_SEC: u32 = 60;
 pub const MAX_SESSION_LIFETIME_SEC: u32 = 7 * 86_400;
@@ -583,7 +584,9 @@ pub mod gamerplex_arcade {
         session.seed = seed;
         session.nonce = nonce;
         session.created_at = now;
-        session.expires_at = now + lifetime_sec as i64;
+        session.expires_at = now
+            .checked_add(lifetime_sec as i64)
+            .ok_or(ArcadeError::Overflow)?;
         session.bump = ctx.bumps.session;
         emit!(SessionOpened {
             player: session.player,
@@ -638,6 +641,35 @@ pub mod gamerplex_arcade {
     ) -> Result<()> {
         require!(category <= CATEGORY_CNFT_WRAP, ArcadeError::InvalidPaymentCategory);
         require!(external_ref.len() <= MAX_EXTERNAL_REF_LEN, ArcadeError::ExternalRefTooLong);
+
+        // Global kill-switch: admin can halt ALL paid actions in an emergency
+        // (faster than a multisig program upgrade). Default false = not paused.
+        require!(!ctx.accounts.payments_config.paused, ArcadeError::PaymentsPaused);
+
+        // C-1: exactly ONE record_payment per transaction. The transfer-proof
+        // helpers below match the FIRST qualifying transfer WITHOUT consuming it,
+        // so without this a single transfer could back many record_payment ix in
+        // one tx (affiliate over-accrual + inflated spend totals). One per tx ⇒
+        // one real transfer per recorded payment. (verify_unique_payment_pairing
+        // enforces the same from the paired-action side; this also covers
+        // standalone Continue/Powerup txs that never reach that helper.)
+        {
+            let sysvar = ctx.accounts.instructions_sysvar.to_account_info();
+            let rp_disc = crate::instruction::RecordPayment::DISCRIMINATOR;
+            let mut rp_count = 0u16;
+            let mut i: usize = 0;
+            loop {
+                let ix = match ix_sysvar::load_instruction_at_checked(i, &sysvar) {
+                    Ok(ix) => ix,
+                    Err(_) => break,
+                };
+                i += 1;
+                if ix.program_id == crate::ID && ix.data.len() >= 8 && &ix.data[0..8] == rp_disc {
+                    rp_count = rp_count.saturating_add(1);
+                }
+            }
+            require!(rp_count == 1, ArcadeError::DuplicateIxInTx);
+        }
 
         // v1.4: mint-aware fixed amounts. $GAME pays 80% of the list price for
         // each fixed-tier category (Score / Verified / Replay / cNFT). All
@@ -1171,6 +1203,33 @@ pub mod gamerplex_arcade {
     }
 
     // ========================================================================
+    // Payments kill-switch (PaymentsConfig sibling PDA)
+    // ========================================================================
+
+    pub fn initialize_payments_config(
+        ctx: Context<InitializePaymentsConfig>,
+    ) -> Result<()> {
+        let p = &mut ctx.accounts.payments_config;
+        p.admin = ctx.accounts.admin.key();
+        p.paused = false;
+        p.bump = ctx.bumps.payments_config;
+        emit!(PaymentsPausedSet { paused: false });
+        Ok(())
+    }
+
+    pub fn set_payments_paused(
+        ctx: Context<UpdatePaymentsConfig>,
+        paused: bool,
+        deadline: i64,
+    ) -> Result<()> {
+        check_deadline(deadline)?;
+        let p = &mut ctx.accounts.payments_config;
+        p.paused = paused;
+        emit!(PaymentsPausedSet { paused });
+        Ok(())
+    }
+
+    // ========================================================================
     // Identity — handle + bio (ProfileExtV2 sibling PDA)
     // ========================================================================
 
@@ -1352,6 +1411,23 @@ pub struct AffiliateConfig {
 impl AffiliateConfig {
     // 8 disc + 32 admin + 1 disabled + 8 min + 1 bump = 50
     pub const SPACE: usize = 8 + 32 + 1 + 8 + 1;
+}
+
+/// Global payments kill-switch. Sibling PDA at seed ["payments"] — additive,
+/// no realloc of the live ArcadeConfig (which holds admin + treasury). When
+/// paused=true, record_payment rejects ALL paid actions: an instant admin
+/// emergency stop that doesn't require a slow multisig program upgrade. Same
+/// sibling-PDA pattern as AffiliateConfig / StablecoinConfig / ExchangeRatesConfig.
+#[account]
+pub struct PaymentsConfig {
+    pub admin: Pubkey,
+    pub paused: bool,
+    pub bump: u8,
+}
+
+impl PaymentsConfig {
+    // 8 disc + 32 admin + 1 paused + 1 bump = 42
+    pub const SPACE: usize = 8 + 32 + 1 + 1;
 }
 
 #[account]
@@ -1716,6 +1792,12 @@ pub struct RecordPayment<'info> {
     /// SPL TransferChecked. Address-constrained to the canonical sysvar id.
     #[account(address = ix_sysvar::ID)]
     pub instructions_sysvar: UncheckedAccount<'info>,
+    // ⚠️ payments_config MUST stay LAST. record_payment is introspected
+    // POSITIONALLY by submit_score (verify_unique_payment_pairing checks
+    // accounts[8] == player). Inserting an account before index 9 shifts
+    // player out of slot [8] and breaks payment pairing. New accounts → end.
+    #[account(seeds = [PAYMENTS_SEED], bump = payments_config.bump)]
+    pub payments_config: Box<Account<'info, PaymentsConfig>>,
 }
 
 #[derive(Accounts)]
@@ -1894,6 +1976,26 @@ pub struct UpdateAffiliateConfig<'info> {
     pub config: Account<'info, ArcadeConfig>,
     #[account(mut, seeds = [AFFILIATE_SEED], bump = affiliate_config.bump)]
     pub affiliate_config: Account<'info, AffiliateConfig>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializePaymentsConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(init, payer = admin, space = PaymentsConfig::SPACE, seeds = [PAYMENTS_SEED], bump)]
+    pub payments_config: Account<'info, PaymentsConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePaymentsConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(mut, seeds = [PAYMENTS_SEED], bump = payments_config.bump)]
+    pub payments_config: Account<'info, PaymentsConfig>,
     pub admin: Signer<'info>,
 }
 
@@ -2108,6 +2210,11 @@ pub struct AffiliateConfigUpdated {
 }
 
 #[event]
+pub struct PaymentsPausedSet {
+    pub paused: bool,
+}
+
+#[event]
 pub struct ProfileExtOpened {
     pub wallet: Pubkey,
     pub created_at: i64,
@@ -2169,7 +2276,10 @@ fn check_deadline(deadline: i64) -> Result<()> {
 fn verify_unique_payment_pairing(
     instructions_sysvar: &AccountInfo,
     payment_category: u8,
-    payment_amount: u64,
+    // The acceptable amount is now derived from the matched payment's own mint
+    // via required_amount() (so a $GAME-discounted payment pairs too). This arg
+    // is retained for caller arity but no longer used for the comparison.
+    _payment_amount: u64,
     current_ix_disc: &[u8],
     record_payment_disc: &[u8],
     player: &Pubkey,
@@ -2206,13 +2316,20 @@ fn verify_unique_payment_pairing(
         //   payment_amount_raw: u64 (8 bytes LE)   — new in v1.3
         //   payment_tx_sig: [u8;64] (64 bytes)
         //   external_ref: String (4-byte len prefix + bytes)
-        // Only category + amount are checked here — later fields don't affect pairing.
-        if ix.data.len() < 8 + 1 + 8 {
+        // category + amount + payment_mint are read here; the mint determines the
+        // acceptable amount (USDC/SOL full price vs the $GAME discount).
+        if ix.data.len() < 8 + 1 + 8 + 32 {
             continue;
         }
         let category = ix.data[8];
         let amount = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
-        if category != payment_category || amount != payment_amount {
+        let mut mint_bytes = [0u8; 32];
+        mint_bytes.copy_from_slice(&ix.data[17..49]);
+        let mint = Pubkey::new_from_array(mint_bytes);
+        // Match the category, and the amount against THIS mint's required price
+        // (required_amount returns the discounted amount when mint == GAME mint),
+        // so a $GAME-paid save pairs as well as a full-price USDC/SOL one.
+        if category != payment_category || amount != required_amount(category, &mint)? {
             continue;
         }
         // RecordPayment account layout (v1.3 + affiliate hardening):
@@ -2584,4 +2701,6 @@ pub enum ArcadeError {
     SessionExpired,
     #[msg("Invalid session lifetime (must be MIN..=MAX seconds).")]
     InvalidSessionLifetime,
+    #[msg("Payments are paused globally by admin. Try again later.")]
+    PaymentsPaused,
 }
