@@ -390,6 +390,20 @@ describe('payment introspection (M3)', () => {
       .add(transferIx(p.publicKey, 40_000))
       .add(await recordPaymentIx(p.publicKey, 40_000, 40_000));
     await rejects(sendAndConfirmTransaction(ctx.conn, tx, [p]), 'InvalidScoreCommitAmount');
+    // ^ also the F3 negative case: a USDC payment at the $GAME-discounted 40_000
+    //   must still be rejected (discount applies only to GAME_TOKEN_MINT). The
+    //   F3 POSITIVE case ($GAME pays 40_000 and pairs) can't run on localnet —
+    //   GAME_TOKEN_MINT is a compile-time address with no keypair here; it's
+    //   verified on devnet via the stress scripts against the real mint.
+  });
+
+  it('🔴 C-1: two record_payment in one tx → DuplicateIxInTx (one transfer cannot back many)', async () => {
+    const p = await setupPayer();
+    const tx = new Transaction()
+      .add(transferIx(p.publicKey, SCORE_COMMIT))
+      .add(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT))
+      .add(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT));
+    await rejects(sendAndConfirmTransaction(ctx.conn, tx, [p]), 'DuplicateIxInTx');
   });
 
   it('PaymentsPaused: kill-switch blocks record_payment, unpause restores', async () => {
