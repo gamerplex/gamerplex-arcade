@@ -162,6 +162,25 @@ async function main() {
     console.log("  → affiliate config already exists, skipping");
   }
 
+  // ── Step 3.5: initialize_payments_config (global kill-switch) ───────────
+  console.log("\nStep 3.5: PaymentsConfig (global payments kill-switch)");
+  const [paymentsAddr] = pda([Buffer.from("payments")]);
+  const payInfo = await conn.getAccountInfo(paymentsAddr);
+  if (!payInfo) {
+    const sigPay = await (program.methods as any)
+      .initializePaymentsConfig()
+      .accounts({
+        config: configAddr,
+        paymentsConfig: paymentsAddr,
+        admin: admin.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    console.log(`  ✓ payments config initialised (paused=false): ${sigPay.slice(0, 20)}…`);
+  } else {
+    console.log("  → payments config already exists, skipping");
+  }
+
   // ── Step 4: register_game(5, flipball) ─────────────────────────────────
   console.log("\nStep 4: register FLIPBALL");
   const [flipballGame] = pda([Buffer.from("game"), Buffer.from([FLIPBALL_GAME_ID])]);
@@ -185,6 +204,7 @@ async function main() {
   const rates: any = await (program.account as any).exchangeRatesConfig.fetch(ratesAddr);
   const sc: any = await (program.account as any).stablecoinConfig.fetch(stablecoinsAddr);
   const aff: any = await (program.account as any).affiliateConfig.fetch(affiliateAddr);
+  const pay: any = await (program.account as any).paymentsConfig.fetch(paymentsAddr);
   const fb: any = await (program.account as any).game.fetch(flipballGame);
   console.log("\n=== State ===");
   console.log("rates.sol_micro_usd_per_lamport :", rates.solMicroUsdPerLamport.toString());
@@ -193,6 +213,7 @@ async function main() {
   console.log("stablecoins                     :", sc.mints.filter((m: PublicKey) => !m.equals(PublicKey.default)).map((m: PublicKey) => m.toBase58()).join(", "));
   console.log("affiliate.disabled              :", aff.disabled);
   console.log("affiliate.min_accrual_micro     :", aff.minAccrualMicro.toString());
+  console.log("payments.paused                 :", pay.paused);
   console.log("flipball game_id                :", fb.gameId);
   console.log("flipball slug                   :", fb.slug);
   console.log(`\n✓ v1.3 upgrade complete on ${MAINNET ? "MAINNET" : "devnet"}`);

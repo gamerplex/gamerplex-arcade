@@ -1,5 +1,13 @@
 #!/usr/bin/env tsx
 /**
+ * ⚠️ DEPRECATED (2026-06-20) — DO NOT RUN. Uses the v1.2 `record_payment` ABI
+ * (old 5-arg `(category, amount, sig, bool, externalRef)` + pre-v1.4 account
+ * lists) and WILL FAIL against the current IDL. Its T1–T3 happy-path throughput
+ * coverage is superseded by:
+ *   • `tests/localnet/run.sh`  — free exhaustive coverage (35 tests, $0), and
+ *   • `scripts/stress-arcade-v1_3.ts` — current devnet stress (v1.4 ABI).
+ * Kept only for historical reference.
+ *
  * Gamerplex Arcade — devnet stress test (A.8 of the Mainnet Readiness Gate)
  *
  * Runs:
@@ -94,6 +102,18 @@ function gamePda(gameId: number) {
 function profilePda(wallet: PublicKey) {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("profile"), wallet.toBuffer()],
+    ARCADE_PROGRAM_ID
+  );
+}
+function profileExtPda(wallet: PublicKey) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("profile-ext"), wallet.toBuffer()],
+    ARCADE_PROGRAM_ID
+  );
+}
+function handleClaimPda(handle: string) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("handle-claim"), Buffer.from(handle, "utf8")],
     ARCADE_PROGRAM_ID
   );
 }

@@ -29,6 +29,11 @@ use anchor_lang::solana_program::{
 use anchor_lang::Discriminator;
 use solana_security_txt::security_txt;
 
+// Program ID is compile-time per network (mirrors GAME_TOKEN_MINT below).
+// Build mainnet artifact with `anchor build -- --features mainnet`.
+#[cfg(feature = "mainnet")]
+declare_id!("GAMEbo12FjDbrobsgy8RbPhMs5kAQtJce3pARCi1cakV");
+#[cfg(not(feature = "mainnet"))]
 declare_id!("4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t");
 
 security_txt! {
@@ -56,6 +61,7 @@ pub const HANDLE_CLAIM_SEED: &[u8] = b"handle-claim";
 pub const RATES_SEED: &[u8] = b"rates";
 pub const AFFILIATE_SEED: &[u8] = b"affiliate";
 pub const SESSION_SEED: &[u8] = b"session";
+pub const PAYMENTS_SEED: &[u8] = b"payments";
 
 pub const MIN_SESSION_LIFETIME_SEC: u32 = 60;
 pub const MAX_SESSION_LIFETIME_SEC: u32 = 7 * 86_400;
@@ -634,6 +640,10 @@ pub mod gamerplex_arcade {
         require!(category <= CATEGORY_CNFT_WRAP, ArcadeError::InvalidPaymentCategory);
         require!(external_ref.len() <= MAX_EXTERNAL_REF_LEN, ArcadeError::ExternalRefTooLong);
 
+        // Global kill-switch: admin can halt ALL paid actions in an emergency
+        // (faster than a multisig program upgrade). Default false = not paused.
+        require!(!ctx.accounts.payments_config.paused, ArcadeError::PaymentsPaused);
+
         // v1.4: mint-aware fixed amounts. $GAME pays 80% of the list price for
         // each fixed-tier category (Score / Verified / Replay / cNFT). All
         // other mints (USDC/USDT/USDF/SOL) pay full list price. Categories
@@ -1166,6 +1176,33 @@ pub mod gamerplex_arcade {
     }
 
     // ========================================================================
+    // Payments kill-switch (PaymentsConfig sibling PDA)
+    // ========================================================================
+
+    pub fn initialize_payments_config(
+        ctx: Context<InitializePaymentsConfig>,
+    ) -> Result<()> {
+        let p = &mut ctx.accounts.payments_config;
+        p.admin = ctx.accounts.admin.key();
+        p.paused = false;
+        p.bump = ctx.bumps.payments_config;
+        emit!(PaymentsPausedSet { paused: false });
+        Ok(())
+    }
+
+    pub fn set_payments_paused(
+        ctx: Context<UpdatePaymentsConfig>,
+        paused: bool,
+        deadline: i64,
+    ) -> Result<()> {
+        check_deadline(deadline)?;
+        let p = &mut ctx.accounts.payments_config;
+        p.paused = paused;
+        emit!(PaymentsPausedSet { paused });
+        Ok(())
+    }
+
+    // ========================================================================
     // Identity — handle + bio (ProfileExtV2 sibling PDA)
     // ========================================================================
 
@@ -1347,6 +1384,23 @@ pub struct AffiliateConfig {
 impl AffiliateConfig {
     // 8 disc + 32 admin + 1 disabled + 8 min + 1 bump = 50
     pub const SPACE: usize = 8 + 32 + 1 + 8 + 1;
+}
+
+/// Global payments kill-switch. Sibling PDA at seed ["payments"] — additive,
+/// no realloc of the live ArcadeConfig (which holds admin + treasury). When
+/// paused=true, record_payment rejects ALL paid actions: an instant admin
+/// emergency stop that doesn't require a slow multisig program upgrade. Same
+/// sibling-PDA pattern as AffiliateConfig / StablecoinConfig / ExchangeRatesConfig.
+#[account]
+pub struct PaymentsConfig {
+    pub admin: Pubkey,
+    pub paused: bool,
+    pub bump: u8,
+}
+
+impl PaymentsConfig {
+    // 8 disc + 32 admin + 1 paused + 1 bump = 42
+    pub const SPACE: usize = 8 + 32 + 1 + 1;
 }
 
 #[account]
@@ -1711,6 +1765,12 @@ pub struct RecordPayment<'info> {
     /// SPL TransferChecked. Address-constrained to the canonical sysvar id.
     #[account(address = ix_sysvar::ID)]
     pub instructions_sysvar: UncheckedAccount<'info>,
+    // ⚠️ payments_config MUST stay LAST. record_payment is introspected
+    // POSITIONALLY by submit_score (verify_unique_payment_pairing checks
+    // accounts[8] == player). Inserting an account before index 9 shifts
+    // player out of slot [8] and breaks payment pairing. New accounts → end.
+    #[account(seeds = [PAYMENTS_SEED], bump = payments_config.bump)]
+    pub payments_config: Box<Account<'info, PaymentsConfig>>,
 }
 
 #[derive(Accounts)]
@@ -1889,6 +1949,26 @@ pub struct UpdateAffiliateConfig<'info> {
     pub config: Account<'info, ArcadeConfig>,
     #[account(mut, seeds = [AFFILIATE_SEED], bump = affiliate_config.bump)]
     pub affiliate_config: Account<'info, AffiliateConfig>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializePaymentsConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(init, payer = admin, space = PaymentsConfig::SPACE, seeds = [PAYMENTS_SEED], bump)]
+    pub payments_config: Account<'info, PaymentsConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePaymentsConfig<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(mut, seeds = [PAYMENTS_SEED], bump = payments_config.bump)]
+    pub payments_config: Account<'info, PaymentsConfig>,
     pub admin: Signer<'info>,
 }
 
@@ -2100,6 +2180,11 @@ pub struct AffiliateConfigInitialized {
 pub struct AffiliateConfigUpdated {
     pub disabled: bool,
     pub min_accrual_micro: u64,
+}
+
+#[event]
+pub struct PaymentsPausedSet {
+    pub paused: bool,
 }
 
 #[event]
@@ -2579,4 +2664,6 @@ pub enum ArcadeError {
     SessionExpired,
     #[msg("Invalid session lifetime (must be MIN..=MAX seconds).")]
     InvalidSessionLifetime,
+    #[msg("Payments are paused globally by admin. Try again later.")]
+    PaymentsPaused,
 }
