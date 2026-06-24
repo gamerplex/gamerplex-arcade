@@ -13,6 +13,7 @@ import {
   Keypair,
   PublicKey,
   Transaction,
+  TransactionInstruction,
   SystemProgram,
   SYSVAR_INSTRUCTIONS_PUBKEY,
   sendAndConfirmTransaction,
@@ -348,6 +349,20 @@ describe('payment introspection (M3)', () => {
       .instruction();
   }
 
+  // Wrap a record_payment ix so it executes via CPI from the test-only attacker
+  // program (account[0]=arcade program, remaining_accounts=the rp keys).
+  const ATTACKER_ID = new PublicKey('ERTfswRtbajRGZsrpAJuJApfsVTnVJtKPobQD7JaB4M4');
+  function attackerCpiIx(rpIx: TransactionInstruction): TransactionInstruction {
+    const disc = crypto.createHash('sha256').update('global:cpi_record_payment').digest().subarray(0, 8);
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(rpIx.data.length, 0);
+    return new TransactionInstruction({
+      programId: ATTACKER_ID,
+      keys: [{ pubkey: ctx.program.programId, isSigner: false, isWritable: false }, ...rpIx.keys],
+      data: Buffer.concat([disc, len, rpIx.data]),
+    });
+  }
+
   it('🔴 REGRESSION: record_payment account[8] MUST be player (introspection invariant)', async () => {
     const dummy = Keypair.generate().publicKey;
     const ix = await recordPaymentIx(dummy, SCORE_COMMIT, SCORE_COMMIT);
@@ -404,6 +419,23 @@ describe('payment introspection (M3)', () => {
       .add(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT))
       .add(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT));
     await rejects(sendAndConfirmTransaction(ctx.conn, tx, [p]), 'DuplicateIxInTx');
+  });
+
+  it('🔴 RA-A: record_payment via CPI alongside a top-level one → CpiNotAllowed', async () => {
+    const p = await setupPayer();
+    const tx = new Transaction()
+      .add(transferIx(p.publicKey, SCORE_COMMIT))
+      .add(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT))
+      .add(attackerCpiIx(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT)));
+    await rejects(sendAndConfirmTransaction(ctx.conn, tx, [p]), 'CpiNotAllowed');
+  });
+
+  it('🔴 RA-A control: CPI-only record_payment → CpiNotAllowed', async () => {
+    const p = await setupPayer();
+    const tx = new Transaction()
+      .add(transferIx(p.publicKey, SCORE_COMMIT))
+      .add(attackerCpiIx(await recordPaymentIx(p.publicKey, SCORE_COMMIT, SCORE_COMMIT)));
+    await rejects(sendAndConfirmTransaction(ctx.conn, tx, [p]), 'CpiNotAllowed');
   });
 
   it('PaymentsPaused: kill-switch blocks record_payment, unpause restores', async () => {
