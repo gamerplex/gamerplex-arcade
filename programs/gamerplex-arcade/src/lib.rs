@@ -22,7 +22,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
-    instruction::Instruction,
+    instruction::{get_stack_height, Instruction, TRANSACTION_LEVEL_STACK_HEIGHT},
     program::invoke,
     sysvar::instructions as ix_sysvar,
 };
@@ -645,6 +645,12 @@ pub mod gamerplex_arcade {
         // Global kill-switch: admin can halt ALL paid actions in an emergency
         // (faster than a multisig program upgrade). Default false = not paused.
         require!(!ctx.accounts.payments_config.paused, ArcadeError::PaymentsPaused);
+
+        // Must be a top-level instruction (introspection below is CPI-blind).
+        require!(
+            get_stack_height() == TRANSACTION_LEVEL_STACK_HEIGHT,
+            ArcadeError::CpiNotAllowed
+        );
 
         // C-1: exactly ONE record_payment per transaction. The transfer-proof
         // helpers below match the FIRST qualifying transfer WITHOUT consuming it,
@@ -2284,6 +2290,11 @@ fn verify_unique_payment_pairing(
     record_payment_disc: &[u8],
     player: &Pubkey,
 ) -> Result<()> {
+    // Must be a top-level instruction (introspection below is CPI-blind).
+    require!(
+        get_stack_height() == TRANSACTION_LEVEL_STACK_HEIGHT,
+        ArcadeError::CpiNotAllowed
+    );
     let mut payment_count = 0u16;
     let mut current_count = 0u16;
     let mut i: usize = 0;
@@ -2647,6 +2658,8 @@ pub enum ArcadeError {
     RequiredPaymentMissing,
     #[msg("This instruction may appear at most once per tx.")]
     DuplicateIxInTx,
+    #[msg("This instruction must be top-level, not invoked via CPI.")]
+    CpiNotAllowed,
     #[msg("Instruction deadline has expired.")]
     InstructionExpired,
     #[msg("Instruction deadline is too far in the future (> MAX_DEADLINE_FUTURE_SEC).")]

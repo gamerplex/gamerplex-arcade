@@ -4,6 +4,7 @@ skip-lint = false
 
 [programs.localnet]
 gamerplex_arcade = "4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t"
+arcade_attacker = "ERTfswRtbajRGZsrpAJuJApfsVTnVJtKPobQD7JaB4M4"
 
 [programs.devnet]
 gamerplex_arcade = "4FVwdxxBp6PTax2tAcPyHE9rYt8tyNf2YBGrSnSqmx8t"
