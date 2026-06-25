@@ -62,6 +62,7 @@ pub const RATES_SEED: &[u8] = b"rates";
 pub const AFFILIATE_SEED: &[u8] = b"affiliate";
 pub const SESSION_SEED: &[u8] = b"session";
 pub const PAYMENTS_SEED: &[u8] = b"payments";
+pub const RESOLVER_SEED: &[u8] = b"resolver";
 
 pub const MIN_SESSION_LIFETIME_SEC: u32 = 60;
 pub const MAX_SESSION_LIFETIME_SEC: u32 = 7 * 86_400;
@@ -1208,6 +1209,18 @@ pub mod gamerplex_arcade {
         Ok(())
     }
 
+    /// Set/rotate the resolver authority (admin-only, deadline-gated). Creates the
+    /// ResolverConfig PDA on first call, updates it after. Admin-gated via the
+    /// config `has_one = admin`, so the init_if_needed path is safe.
+    pub fn set_resolver(ctx: Context<SetResolver>, resolver: Pubkey, deadline: i64) -> Result<()> {
+        check_deadline(deadline)?;
+        let rc = &mut ctx.accounts.resolver_config;
+        rc.resolver = resolver;
+        rc.bump = ctx.bumps.resolver_config;
+        emit!(ResolverSet { resolver });
+        Ok(())
+    }
+
     // ========================================================================
     // Payments kill-switch (PaymentsConfig sibling PDA)
     // ========================================================================
@@ -1357,6 +1370,21 @@ pub struct ArcadeConfig {
 impl ArcadeConfig {
     // 8 (disc) + 32 + 32 + 2 + 1 + 4 + 8 + 8 + 1
     pub const SPACE: usize = 8 + 32 + 32 + 2 + 1 + 4 + 8 + 8 + 1;
+}
+
+/// Resolver authority — the service key that (a) issues sessions on the player's
+/// behalf and (b) co-signs replay-receipt mints to ATTEST a validated run. Kept in
+/// its own PDA (not ArcadeConfig) so the deployed config's layout is undisturbed,
+/// matching the StablecoinConfig/RatesConfig/AffiliateConfig pattern.
+#[account]
+pub struct ResolverConfig {
+    pub resolver: Pubkey,
+    pub bump: u8,
+}
+
+impl ResolverConfig {
+    // 8 disc + 32 resolver + 1 bump
+    pub const SPACE: usize = 8 + 32 + 1;
 }
 
 /// Allowlist of stablecoin mints accepted for arcade payments. Stored in a
@@ -1758,10 +1786,14 @@ pub struct OpenSession<'info> {
         bump,
     )]
     pub session: Account<'info, Session>,
-    /// CHECK: the player the session binds to. Not required to sign — server
-    /// opens on their behalf so player UX stays one-click.
+    #[account(seeds = [RESOLVER_SEED], bump = resolver_config.bump)]
+    pub resolver_config: Account<'info, ResolverConfig>,
+    /// CHECK: the player the session binds to. Not required to sign — the
+    /// resolver opens on their behalf so player UX stays one-click. H1: the
+    /// funder MUST be the configured resolver, so the daily/challenge seed is a
+    /// genuine server commitment (not attacker-chosen).
     pub player: AccountInfo<'info>,
-    #[account(mut)]
+    #[account(mut, constraint = funder.key() == resolver_config.resolver @ ArcadeError::UnauthorizedResolver)]
     pub funder: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
@@ -1829,6 +1861,12 @@ pub struct MintReplayReceipt<'info> {
     pub receipt: Account<'info, ReplayReceipt>,
     #[account(mut)]
     pub player: Signer<'info>,
+    #[account(seeds = [RESOLVER_SEED], bump = resolver_config.bump)]
+    pub resolver_config: Account<'info, ResolverConfig>,
+    /// I2: the resolver co-signs to ATTEST a replay-validated run, so the on-chain
+    /// score/move_hash are validator-attested rather than player-forgeable.
+    #[account(address = resolver_config.resolver @ ArcadeError::UnauthorizedResolver)]
+    pub resolver: Signer<'info>,
     pub system_program: Program<'info, System>,
     /// CHECK: Instructions sysvar — read-only, introspected for the matching
     /// record_payment(REPLAY_RECEIPT).
@@ -1991,6 +2029,23 @@ pub struct InitializePaymentsConfig<'info> {
     pub config: Account<'info, ArcadeConfig>,
     #[account(init, payer = admin, space = PaymentsConfig::SPACE, seeds = [PAYMENTS_SEED], bump)]
     pub payments_config: Account<'info, PaymentsConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetResolver<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ ArcadeError::AdminOnly)]
+    pub config: Account<'info, ArcadeConfig>,
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = ResolverConfig::SPACE,
+        seeds = [RESOLVER_SEED],
+        bump,
+    )]
+    pub resolver_config: Account<'info, ResolverConfig>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -2201,6 +2256,11 @@ pub struct ExchangeRatesUpdated {
     pub sol_updated: bool,
     pub game_updated: bool,
     pub updated_at: i64,
+}
+
+#[event]
+pub struct ResolverSet {
+    pub resolver: Pubkey,
 }
 
 #[event]
@@ -2587,6 +2647,8 @@ fn base64_encode(data: &[u8]) -> String {
 pub enum ArcadeError {
     #[msg("Only the admin can call this instruction.")]
     AdminOnly,
+    #[msg("Caller is not the configured resolver authority.")]
+    UnauthorizedResolver,
     #[msg("Profile owner does not match the signer.")]
     ProfileOwnerMismatch,
     #[msg("Game slug exceeds the maximum length.")]
