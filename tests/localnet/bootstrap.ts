@@ -37,6 +37,7 @@ export const PDAS = {
   receipt: (w: PublicKey, nonce: number | bigint) => pda([enc('receipt'), w.toBuffer(), le8(nonce)]),
   profileExt: (w: PublicKey) => pda([enc('profile-ext'), w.toBuffer()]),
   handleClaim: (handle: string) => pda([enc('handle-claim'), enc(handle)]),
+  resolverConfig: () => pda([enc('resolver')]),
 };
 
 export async function airdrop(conn: Connection, to: PublicKey, sol = 100) {
@@ -48,6 +49,7 @@ export interface Ctx {
   conn: Connection;
   admin: Keypair;
   treasury: Keypair;
+  resolver: Keypair;
   program: anchor.Program;
   usdcMint: PublicKey;
 }
@@ -113,6 +115,15 @@ export async function bootstrap(): Promise<Ctx> {
     .rpc();
   log('✓ register_game(1)');
 
+  // 7) resolver authority — the service key that issues sessions + attests receipts
+  const resolver = Keypair.generate();
+  await airdrop(conn, resolver.publicKey, 100);
+  await program.methods
+    .setResolver(resolver.publicKey, deadline)
+    .accounts({ admin: admin.publicKey })
+    .rpc();
+  log('✓ set_resolver');
+
   // verify every PDA exists + is program-owned
   for (const [name, key] of [
     ['config', PDAS.config()],
@@ -128,7 +139,7 @@ export async function bootstrap(): Promise<Ctx> {
     }
   }
   log('✓ all config PDAs verified program-owned');
-  return { conn, admin, treasury, program, usdcMint };
+  return { conn, admin, treasury, resolver, program, usdcMint };
 }
 
 // Run standalone

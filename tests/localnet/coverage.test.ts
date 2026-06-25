@@ -524,16 +524,24 @@ describe('sessions, receipts, handle/bio (M4)', () => {
     await rejects(ctx.program.methods.setHandle('bob').accounts(setHandleAccts(p2.publicKey, 'bob')).signers([p2]).rpc(), 'already in use');
   });
 
-  it('open_session happy + InvalidSessionLifetime', async () => {
+  it('open_session resolver-issued + InvalidSessionLifetime + H1 non-resolver rejected', async () => {
     const p = await fundedPlayer();
+    const rc = PDAS.resolverConfig();
     const seed = Array.from(crypto.randomBytes(32));
+    // happy: the resolver funds/opens on the player's behalf
     await ctx.program.methods.openSession(new anchor.BN(1), 1, seed, 3600)
-      .accounts({ session: PDAS.session(p.publicKey, 1), player: p.publicKey, funder: p.publicKey }).signers([p]).rpc();
+      .accounts({ session: PDAS.session(p.publicKey, 1), resolverConfig: rc, player: p.publicKey, funder: ctx.resolver.publicKey }).signers([ctx.resolver]).rpc();
     expect(await ctx.conn.getAccountInfo(PDAS.session(p.publicKey, 1))).not.toBeNull();
     await rejects(
       ctx.program.methods.openSession(new anchor.BN(2), 1, seed, 30)
-        .accounts({ session: PDAS.session(p.publicKey, 2), player: p.publicKey, funder: p.publicKey }).signers([p]).rpc(),
+        .accounts({ session: PDAS.session(p.publicKey, 2), resolverConfig: rc, player: p.publicKey, funder: ctx.resolver.publicKey }).signers([ctx.resolver]).rpc(),
       'InvalidSessionLifetime'
+    );
+    // H1: a non-resolver funder cannot open a session (anti-grind: the seed is a server commitment)
+    await rejects(
+      ctx.program.methods.openSession(new anchor.BN(3), 1, seed, 3600)
+        .accounts({ session: PDAS.session(p.publicKey, 3), resolverConfig: rc, player: p.publicKey, funder: p.publicKey }).signers([p]).rpc(),
+      'UnauthorizedResolver'
     );
   });
 
@@ -544,12 +552,13 @@ describe('sessions, receipts, handle/bio (M4)', () => {
     const moveHash = Array.from(crypto.createHash('sha256').update(Buffer.alloc(0)).digest());
     const mintIx = await ctx.program.methods
       .mintReplayReceipt(new anchor.BN(nonce), new anchor.BN(5000), 0, 0, seed, moveHash, 30, Array.from(new Uint8Array(64)))
-      .accounts({ config: PDAS.config(), game: PDAS.game(1), receipt: PDAS.receipt(p.publicKey, nonce), player: p.publicKey, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
+      .accounts({ config: PDAS.config(), game: PDAS.game(1), receipt: PDAS.receipt(p.publicKey, nonce), player: p.publicKey, resolverConfig: PDAS.resolverConfig(), resolver: ctx.resolver.publicKey, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
       .instruction();
     await sendAndConfirmTransaction(
       ctx.conn,
+      // I2: the resolver co-signs to attest the validated run
       new Transaction().add(xfer(p.publicKey, 250_000)).add(await recPay(p.publicKey, 5, 250_000)).add(mintIx),
-      [p]
+      [p, ctx.resolver]
     );
     const rkey = PDAS.receipt(p.publicKey, nonce);
     const acct = (ctx.program.account as Record<string, { fetch: (k: PublicKey) => Promise<{ owner: PublicKey; originalPlayer: PublicKey }> }>).replayReceipt;
@@ -571,6 +580,23 @@ describe('sessions, receipts, handle/bio (M4)', () => {
     await airdrop(ctx.conn, newOwner.publicKey, 1);
     await ctx.program.methods.closeReplayReceipt().accounts({ receipt: rkey, owner: newOwner.publicKey }).signers([newOwner]).rpc();
     expect(await ctx.conn.getAccountInfo(rkey)).toBeNull();
+  });
+
+  it('I2: mint without the resolver attestation is rejected', async () => {
+    const p = await payer();
+    const nonce = 8;
+    const seed = Array.from(crypto.randomBytes(32));
+    const moveHash = Array.from(crypto.createHash('sha256').update(Buffer.alloc(0)).digest());
+    const mintIx = await ctx.program.methods
+      .mintReplayReceipt(new anchor.BN(nonce), new anchor.BN(5000), 0, 0, seed, moveHash, 30, Array.from(new Uint8Array(64)))
+      .accounts({ config: PDAS.config(), game: PDAS.game(1), receipt: PDAS.receipt(p.publicKey, nonce), player: p.publicKey, resolverConfig: PDAS.resolverConfig(), resolver: ctx.resolver.publicKey, instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY })
+      .instruction();
+    // omit the resolver signer → the tx is missing a required signature → rejected
+    await expect(sendAndConfirmTransaction(
+      ctx.conn,
+      new Transaction().add(xfer(p.publicKey, 250_000)).add(await recPay(p.publicKey, 5, 250_000)).add(mintIx),
+      [p]
+    )).rejects.toThrow();
   });
 });
 
